@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>libsignal-wasm basic example</title>
+  </head>
+  <body>
+    <pre id="output">Loading...</pre>
+    <script type="module">
+      import init, {
+        IdentityKeyPair,
+        KEMKeyPair,
+        KyberPreKeyRecord,
+        PreKeyBundle,
+        PreKeyRecord,
+        PrivateKey,
+        ProtocolAddress,
+        SignalProtocolStore,
+        SignedPreKeyRecord,
+        processPreKeyBundle,
+        signalDecrypt,
+        signalEncrypt,
+      } from "../pkg/libsignal_wasm.js";
+
+      const out = document.querySelector("#output");
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+
+      function identityPairFromPrivate(privateKey) {
+        const bytes = privateKey.serialize();
+        const privateClone = PrivateKey.deserialize(bytes);
+        const publicClone = PrivateKey.deserialize(bytes).getPublicKey();
+        return new IdentityKeyPair(publicClone, privateClone);
+      }
+
+      await init();
+
+      const aliceIdentity = PrivateKey.generate();
+      const bobIdentity = PrivateKey.generate();
+      const aliceAddress = ProtocolAddress.new("+14151111111", 1);
+      const bobAddress = ProtocolAddress.new("+19192222222", 1);
+
+      const aliceStore = new SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      const bobStore = new SignalProtocolStore(
+        identityPairFromPrivate(bobIdentity),
+        5,
+      );
+
+      const bobPreKeyId = 31337;
+      const bobPreKey = PrivateKey.generate();
+      const bobSignedPreKeyId = 22;
+      const bobSignedPreKey = PrivateKey.generate();
+      const bobSignedPreKeySignature = bobIdentity.sign(
+        bobSignedPreKey.getPublicKey().serialize(),
+      );
+      const bobKyberPreKeyId = 777;
+      const bobKyberKeyPair = KEMKeyPair.generate();
+      const bobKyberPreKeySignature = bobIdentity.sign(
+        bobKyberKeyPair.getPublicKey().serialize(),
+      );
+
+      bobStore.savePreKey(
+        bobPreKeyId,
+        PreKeyRecord.new(bobPreKeyId, bobPreKey.getPublicKey(), bobPreKey),
+      );
+      bobStore.saveSignedPreKey(
+        bobSignedPreKeyId,
+        SignedPreKeyRecord.new(
+          bobSignedPreKeyId,
+          Date.now(),
+          bobSignedPreKey.getPublicKey(),
+          bobSignedPreKey,
+          bobSignedPreKeySignature,
+        ),
+      );
+      bobStore.saveKyberPreKey(
+        bobKyberPreKeyId,
+        KyberPreKeyRecord.new(
+          bobKyberPreKeyId,
+          Date.now(),
+          bobKyberKeyPair,
+          bobKyberPreKeySignature,
+        ),
+      );
+
+      const bobBundle = PreKeyBundle.new(
+        5,
+        1,
+        bobPreKeyId,
+        bobPreKey.getPublicKey(),
+        bobSignedPreKeyId,
+        bobSignedPreKey.getPublicKey(),
+        bobSignedPreKeySignature,
+        bobIdentity.getPublicKey(),
+        bobKyberPreKeyId,
+        bobKyberKeyPair.getPublicKey(),
+        bobKyberPreKeySignature,
+      );
+
+      processPreKeyBundle(bobBundle, bobAddress, aliceAddress, aliceStore, Date.now());
+
+      const aliceMessage = encoder.encode("hello from libsignal-wasm");
+      const aliceCiphertext = signalEncrypt(
+        aliceMessage,
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        Date.now(),
+      );
+      const bobPlaintext = signalDecrypt(
+        aliceCiphertext,
+        aliceAddress,
+        bobAddress,
+        bobStore,
+      );
+
+      const restoredAliceStore = SignalProtocolStore.fromSnapshot(
+        aliceStore.exportSnapshot(),
+      );
+      const bobReply = encoder.encode("reply after snapshot restore");
+      const bobCiphertext = signalEncrypt(
+        bobReply,
+        aliceAddress,
+        bobAddress,
+        bobStore,
+        Date.now(),
+      );
+      const alicePlaintext = signalDecrypt(
+        bobCiphertext,
+        bobAddress,
+        aliceAddress,
+        restoredAliceStore,
+      );
+
+      out.textContent = JSON.stringify(
+        {
+          aliceCiphertextType: aliceCiphertext.type(),
+          bobPlaintext: decoder.decode(bobPlaintext),
+          bobCiphertextType: bobCiphertext.type(),
+          alicePlaintext: decoder.decode(alicePlaintext),
+          aliceSnapshotBytes: aliceStore.exportSnapshot().length,
+        },
+        null,
+        2,
+      );
+    </script>
+  </body>
+</html>

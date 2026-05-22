@@ -1,0 +1,20 @@
+{
+  "name": "libsignal-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir pkg --release",
+    "build:debug": "wasm-pack build --target web --out-dir pkg --dev",
+    "check:wasm": "cargo check --target wasm32-unknown-unknown",
+    "serve:example": "python3 -m http.server 8080",
+    "test:browser": "playwright test",
+    "test:browser:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

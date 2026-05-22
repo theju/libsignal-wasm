@@ -1,0 +1,2824 @@
+import { expect, test } from '@playwright/test';
+
+async function runWasm(page, callback) {
+  await page.goto('/tests/browser/harness.html');
+  return page.evaluate(async (source) => {
+    const mod = await import('/pkg/libsignal_wasm.js');
+    await mod.default();
+    const fn = new Function('mod', `return (${source})(mod);`);
+    return fn(mod);
+  }, callback.toString());
+}
+
+test.describe('browser WASM setup', () => {
+  test('loads the module and runs local primitives in Chromium', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const privateKey = mod.PrivateKey.generate();
+      const publicKey = privateKey.getPublicKey();
+      const message = encoder.encode('browser smoke test');
+      const signature = privateKey.sign(message);
+      const usernameLink = mod.usernameCreateLink('moxie.01', null);
+
+      return {
+        publicKeyLength: publicKey.serialize().length,
+        signatureLength: signature.length,
+        signatureValid: publicKey.verify(message, signature),
+        usernameHashLength: mod.usernameHash('moxie.01').length,
+        usernameLinkEntropyLength: usernameLink.entropy.length,
+        decryptedUsername: mod.usernameDecryptLink(
+          usernameLink.entropy,
+          usernameLink.encryptedUsername,
+        ),
+      };
+    });
+
+    expect(result).toEqual({
+      publicKeyLength: 33,
+      signatureLength: 64,
+      signatureValid: true,
+      usernameHashLength: 32,
+      usernameLinkEntropyLength: 32,
+      decryptedUsername: 'moxie.01',
+    });
+  });
+});
+
+test.describe('Address and ServiceId parity', () => {
+  test('round-trips ACI, PNI, ServiceId, and ProtocolAddress values', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const aciUuid = '9d0652a3-dcc3-4d11-975f-74d61598733f';
+      const pniUuid = '796abedb-ca4e-4f18-8803-1fde5b921f9f';
+      const aci = mod.Aci.fromUuid(aciUuid);
+      const pni = mod.Pni.fromUuid(pniUuid);
+      const aciServiceId = mod.ServiceId.parseFromServiceIdString(
+        aci.getServiceIdString(),
+      );
+      const pniServiceId = mod.ServiceId.parseFromServiceIdString(
+        pni.getServiceIdString(),
+      );
+      const aciAddress = mod.ProtocolAddress.newFromAci(aci, 1);
+      const pniAddress = mod.ProtocolAddress.newFromPni(pni, 2);
+      const plainAddress = mod.ProtocolAddress.new('name', 42);
+
+      return {
+        aciServiceId: aci.getServiceIdString(),
+        pniServiceId: pni.getServiceIdString(),
+        aciRoundTrip: aciServiceId.getServiceIdString(),
+        pniRoundTrip: pniServiceId.getServiceIdString(),
+        aciFixedWidthLength: aci.getServiceIdFixedWidthBinary().length,
+        pniFixedWidthLength: pni.getServiceIdFixedWidthBinary().length,
+        aciAddress: {
+          name: aciAddress.name(),
+          deviceId: aciAddress.deviceId(),
+          serviceId: aciAddress.serviceId().getServiceIdString(),
+        },
+        pniAddress: {
+          name: pniAddress.name(),
+          deviceId: pniAddress.deviceId(),
+          serviceId: pniAddress.serviceId().getServiceIdString(),
+        },
+        plainAddress: {
+          name: plainAddress.name(),
+          deviceId: plainAddress.deviceId(),
+          serviceId: plainAddress.serviceId() ?? null,
+        },
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/protocol/AddressTest.ts.
+    expect(result).toEqual({
+      aciServiceId: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+      pniServiceId: 'PNI:796abedb-ca4e-4f18-8803-1fde5b921f9f',
+      aciRoundTrip: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+      pniRoundTrip: 'PNI:796abedb-ca4e-4f18-8803-1fde5b921f9f',
+      aciFixedWidthLength: 17,
+      pniFixedWidthLength: 17,
+      aciAddress: {
+        name: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        deviceId: 1,
+        serviceId: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+      },
+      pniAddress: {
+        name: 'PNI:796abedb-ca4e-4f18-8803-1fde5b921f9f',
+        deviceId: 2,
+        serviceId: 'PNI:796abedb-ca4e-4f18-8803-1fde5b921f9f',
+      },
+      plainAddress: {
+        name: 'name',
+        deviceId: 42,
+        serviceId: null,
+      },
+    });
+  });
+});
+
+test.describe('Public API crypto parity', () => {
+  test('matches upstream HKDF and AES-GCM-SIV vectors', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const bytesFromHex = (hex) => {
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i += 1) {
+          bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+      };
+      const hexFromBytes = (bytes) =>
+        [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+
+      const secret = bytesFromHex('0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B');
+      const empty = new Uint8Array();
+      const salt = bytesFromHex('000102030405060708090A0B0C');
+      const label = bytesFromHex('F0F1F2F3F4F5F6F7F8F9');
+      const aes = mod.Aes256GcmSiv.new(
+        bytesFromHex('0100000000000000000000000000000000000000000000000000000000000000'),
+      );
+      const nonce = bytesFromHex('030000000000000000000000');
+      const aad = bytesFromHex('010000000000000000000000');
+      const plaintext = bytesFromHex('02000000');
+      const ciphertext = aes.encrypt(plaintext, nonce, aad);
+
+      return {
+        hkdfEmptySalt: hexFromBytes(mod.hkdf(42, secret, empty, empty)),
+        hkdfNullSalt: hexFromBytes(mod.hkdf(42, secret, empty, null)),
+        hkdfRfc: hexFromBytes(mod.hkdf(42, secret, label, salt)),
+        aesCiphertext: hexFromBytes(ciphertext),
+        aesPlaintext: hexFromBytes(aes.decrypt(ciphertext, nonce, aad)),
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/PublicAPITest.ts.
+    expect(result).toEqual({
+      hkdfEmptySalt:
+        '8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8',
+      hkdfNullSalt:
+        '8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8',
+      hkdfRfc:
+        '3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865',
+      aesCiphertext: '22b3f4cd1835e517741dfddccfa07fa4661b74cf',
+      aesPlaintext: '02000000',
+    });
+  });
+});
+
+test.describe('Account key and PIN parity', () => {
+  test('matches upstream account-key and PIN vectors', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const bytesFromHex = (hex) => {
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i += 1) {
+          bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+      };
+      const hexFromBytes = (bytes) =>
+        [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+
+      const pool = mod.AccountEntropyPool.generate();
+      const backupKey = mod.AccountEntropyPool.deriveBackupKey(pool);
+      const randomBackupKey = mod.BackupKey.generateRandom();
+      const aci = mod.Aci.fromUuidBytes(new Uint8Array(16).fill(0x11));
+      const mediaId = backupKey.deriveMediaId('example.jpg');
+      const testPin = encoder.encode('password');
+      const testSalt = bytesFromHex(
+        '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
+      );
+      const secondPin = encoder.encode('anotherpassword');
+      const secondSalt = bytesFromHex(
+        '202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f',
+      );
+      const pinHash = mod.PinHash.fromSalt(testPin, testSalt);
+      const secondPinHash = mod.PinHash.fromSalt(secondPin, secondSalt);
+      const localHash = mod.Pin.localHash(testPin);
+
+      return {
+        poolValid: mod.AccountEntropyPool.isValid(pool),
+        poolFormat: /^[a-z0-9]{64}$/.test(pool),
+        svrKeyLength: mod.AccountEntropyPool.deriveSvrKey(pool).length,
+        backupKeyLength: backupKey.serialize().length,
+        randomBackupDifferent:
+          hexFromBytes(backupKey.serialize()) !== hexFromBytes(randomBackupKey.serialize()),
+        backupIdLength: backupKey.deriveBackupId(aci).length,
+        ecKeyLength: backupKey.deriveEcKey(aci).serialize().length,
+        localMetadataKeyLength: backupKey.deriveLocalBackupMetadataKey().length,
+        mediaIdLength: mediaId.length,
+        mediaKeyLength: backupKey.deriveMediaEncryptionKey(mediaId).length,
+        thumbnailKeyLength: backupKey.deriveThumbnailTransitEncryptionKey(mediaId).length,
+        pinAccessKey: hexFromBytes(pinHash.accessKey),
+        pinEncryptionKey: hexFromBytes(pinHash.encryptionKey),
+        secondPinAccessKey: hexFromBytes(secondPinHash.accessKey),
+        secondPinEncryptionKey: hexFromBytes(secondPinHash.encryptionKey),
+        localHashWorks: mod.Pin.verifyLocalHash(localHash, testPin),
+        localHashRejectsWrongPin: mod.Pin.verifyLocalHash(
+          localHash,
+          encoder.encode('badpassword'),
+        ),
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/AccountKeysTest.ts.
+    expect(result).toEqual({
+      poolValid: true,
+      poolFormat: true,
+      svrKeyLength: 32,
+      backupKeyLength: 32,
+      randomBackupDifferent: true,
+      backupIdLength: 16,
+      ecKeyLength: 32,
+      localMetadataKeyLength: 32,
+      mediaIdLength: 15,
+      mediaKeyLength: 64,
+      thumbnailKeyLength: 64,
+      pinAccessKey: 'ab7e8499d21f80a6600b3b9ee349ac6d72c07e3359fe885a934ba7aa844429f8',
+      pinEncryptionKey:
+        '44652df80490fc66bb864a9e638b2f7dc9e20649671dd66bbb9c37bee2bfecf1',
+      secondPinAccessKey:
+        '301d9dd1e96f20ce51083f67d3298fd37b97525de8324d5e12ed2d407d3d927b',
+      secondPinEncryptionKey:
+        'b6f16aa0591732e339b7e99cdd5fd6586a1c285c9d66876947fd82f66ed99757',
+      localHashWorks: true,
+      localHashRejectsWrongPin: false,
+    });
+  });
+});
+
+test.describe('Signal protocol session parity', () => {
+  test('performs pre-key session setup, encrypt/decrypt, and snapshot restore', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const aliceIdentity = mod.PrivateKey.generate();
+      const bobIdentity = mod.PrivateKey.generate();
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+      const aliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      const bobStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(bobIdentity),
+        5,
+      );
+      const aliceAddress = mod.ProtocolAddress.new('+14151111111', 1);
+      const bobAddress = mod.ProtocolAddress.new('+19192222222', 1);
+
+      const bobPreKeyId = 31337;
+      const bobPreKey = mod.PrivateKey.generate();
+      const bobSignedPreKeyId = 22;
+      const bobSignedPreKey = mod.PrivateKey.generate();
+      const bobSignedPreKeySignature = bobIdentity.sign(
+        bobSignedPreKey.getPublicKey().serialize(),
+      );
+      const bobKyberPreKeyId = 777;
+      const bobKyberKeyPair = mod.KEMKeyPair.generate();
+      const bobKyberPreKeySignature = bobIdentity.sign(
+        bobKyberKeyPair.getPublicKey().serialize(),
+      );
+      bobStore.savePreKey(
+        bobPreKeyId,
+        mod.PreKeyRecord.new(bobPreKeyId, bobPreKey.getPublicKey(), bobPreKey),
+      );
+      bobStore.saveSignedPreKey(
+        bobSignedPreKeyId,
+        mod.SignedPreKeyRecord.new(
+          bobSignedPreKeyId,
+          42,
+          bobSignedPreKey.getPublicKey(),
+          bobSignedPreKey,
+          bobSignedPreKeySignature,
+        ),
+      );
+      bobStore.saveKyberPreKey(
+        bobKyberPreKeyId,
+        mod.KyberPreKeyRecord.new(
+          bobKyberPreKeyId,
+          42,
+          bobKyberKeyPair,
+          bobKyberPreKeySignature,
+        ),
+      );
+      const bobBundle = mod.PreKeyBundle.new(
+        5,
+        1,
+        bobPreKeyId,
+        bobPreKey.getPublicKey(),
+        bobSignedPreKeyId,
+        bobSignedPreKey.getPublicKey(),
+        bobSignedPreKeySignature,
+        bobIdentity.getPublicKey(),
+        bobKyberPreKeyId,
+        bobKyberKeyPair.getPublicKey(),
+        bobKyberPreKeySignature,
+      );
+
+      mod.processPreKeyBundle(bobBundle, bobAddress, aliceAddress, aliceStore, 42);
+      const aliceMessage = encoder.encode('Greetings hoo-man');
+      const aliceCiphertext = mod.signalEncrypt(
+        aliceMessage,
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        43,
+      );
+      const bobPlaintext = mod.signalDecrypt(
+        aliceCiphertext,
+        aliceAddress,
+        bobAddress,
+        bobStore,
+      );
+      const bobMessage = encoder.encode(
+        'Sometimes the only thing more dangerous than a question is an answer.',
+      );
+      const bobCiphertext = mod.signalEncrypt(
+        bobMessage,
+        aliceAddress,
+        bobAddress,
+        bobStore,
+        44,
+      );
+      const restoredAliceStore = mod.SignalProtocolStore.fromSnapshot(
+        aliceStore.exportSnapshot(),
+      );
+      const alicePlaintext = mod.signalDecrypt(
+        bobCiphertext,
+        bobAddress,
+        aliceAddress,
+        restoredAliceStore,
+      );
+      const bobSession = bobStore.loadSession(aliceAddress);
+
+      return {
+        aliceCiphertextType: aliceCiphertext.type(),
+        bobCiphertextType: bobCiphertext.type(),
+        bobPlaintext: decoder.decode(bobPlaintext),
+        alicePlaintext: decoder.decode(alicePlaintext),
+        bobSessionSerializedLength: bobSession.serialize().length,
+        bobSessionLocalRegistrationId: bobSession.localRegistrationId(),
+        bobSessionRemoteRegistrationId: bobSession.remoteRegistrationId(),
+        bobSessionHasCurrentState: bobSession.hasCurrentState(1.0, 44),
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/protocol/ProtocolTest.ts BasicPreKeyMessaging.
+    expect(result).toEqual({
+      aliceCiphertextType: 3,
+      bobCiphertextType: 2,
+      bobPlaintext: 'Greetings hoo-man',
+      alicePlaintext:
+        'Sometimes the only thing more dangerous than a question is an answer.',
+      bobSessionLocalRegistrationId: 5,
+      bobSessionRemoteRegistrationId: 5,
+      bobSessionHasCurrentState: true,
+      bobSessionSerializedLength: expect.any(Number),
+    });
+    expect(result.bobSessionSerializedLength).toBeGreaterThan(0);
+  });
+
+  test('enforces identity trust across pre-key bundle processing and snapshots', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const captureError = (callback) => {
+        try {
+          callback();
+          return null;
+        } catch (error) {
+          return error.message;
+        }
+      };
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+      const makeBundle = (identity, deviceId, idOffset) => {
+        const preKey = mod.PrivateKey.generate();
+        const signedPreKey = mod.PrivateKey.generate();
+        const kyberKeyPair = mod.KEMKeyPair.generate();
+        const signedPreKeySignature = identity.sign(
+          signedPreKey.getPublicKey().serialize(),
+        );
+        const kyberPreKeySignature = identity.sign(
+          kyberKeyPair.getPublicKey().serialize(),
+        );
+        return mod.PreKeyBundle.new(
+          5,
+          deviceId,
+          1000 + idOffset,
+          preKey.getPublicKey(),
+          2000 + idOffset,
+          signedPreKey.getPublicKey(),
+          signedPreKeySignature,
+          identity.getPublicKey(),
+          3000 + idOffset,
+          kyberKeyPair.getPublicKey(),
+          kyberPreKeySignature,
+        );
+      };
+
+      const aliceIdentity = mod.PrivateKey.generate();
+      const originalBobIdentity = mod.PrivateKey.generate();
+      const changedBobIdentity = mod.PrivateKey.generate();
+      const aliceAddress = mod.ProtocolAddress.new('+14151111111', 1);
+      const bobAddress = mod.ProtocolAddress.new('+19192222222', 1);
+      const aliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+
+      mod.processPreKeyBundle(
+        makeBundle(originalBobIdentity, 1, 1),
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        42,
+      );
+      mod.processPreKeyBundle(
+        makeBundle(originalBobIdentity, 1, 2),
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        43,
+      );
+      const changedIdentityError = captureError(() =>
+        mod.processPreKeyBundle(
+          makeBundle(changedBobIdentity, 1, 3),
+          bobAddress,
+          aliceAddress,
+          aliceStore,
+          44,
+        ),
+      );
+      const restoredStore = mod.SignalProtocolStore.fromSnapshot(
+        aliceStore.exportSnapshot(),
+      );
+      const restoredChangedIdentityError = captureError(() =>
+        mod.processPreKeyBundle(
+          makeBundle(changedBobIdentity, 1, 4),
+          bobAddress,
+          aliceAddress,
+          restoredStore,
+          45,
+        ),
+      );
+      const freshStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      mod.processPreKeyBundle(
+        makeBundle(changedBobIdentity, 1, 5),
+        bobAddress,
+        aliceAddress,
+        freshStore,
+        46,
+      );
+
+      const aliceSession = aliceStore.loadSession(bobAddress);
+      const freshSession = freshStore.loadSession(bobAddress);
+      return {
+        changedIdentityRejected: changedIdentityError !== null,
+        changedIdentityError,
+        restoredChangedIdentityError,
+        aliceSessionRemoteRegistrationId: aliceSession.remoteRegistrationId(),
+        freshStoreAcceptedChangedIdentity: freshSession.remoteRegistrationId(),
+      };
+    });
+
+    // Mirrors the Node test-store trust model: unknown/same identities are trusted,
+    // changed known identities are rejected until accepted through a new trust state.
+    expect(result.changedIdentityRejected).toBe(true);
+    expect(result.changedIdentityError).toBeTruthy();
+    expect(result.restoredChangedIdentityError).toBeTruthy();
+    expect(result.aliceSessionRemoteRegistrationId).toBe(5);
+    expect(result.freshStoreAcceptedChangedIdentity).toBe(5);
+  });
+});
+
+test.describe('SenderKeyDistributionMessage parity', () => {
+  test('creates a distribution message and encrypts/decrypts group messages', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const sender = mod.ProtocolAddress.new('sender', 1);
+      const distributionId = 'd1d1d1d1-7000-11eb-b32a-33b8a8a487a6';
+      const aliceIdentity = mod.PrivateKey.generate();
+      const bobIdentity = mod.PrivateKey.generate();
+      const aliceStore = new mod.SignalProtocolStore(
+        new mod.IdentityKeyPair(aliceIdentity.getPublicKey(), aliceIdentity),
+        5,
+      );
+      const bobStore = new mod.SignalProtocolStore(
+        new mod.IdentityKeyPair(bobIdentity.getPublicKey(), bobIdentity),
+        5,
+      );
+      const distribution = mod.SenderKeyDistributionMessage.create(
+        sender,
+        distributionId,
+        aliceStore,
+      );
+      mod.processSenderKeyDistributionMessage(sender, distribution, bobStore);
+      const message = Uint8Array.from([0x0a, 0x0b, 0x0c]);
+      const ciphertext = mod.groupEncrypt(sender, distributionId, aliceStore, message);
+      const plaintext = mod.groupDecrypt(sender, bobStore, ciphertext.serialize());
+      const nextDistribution = mod.SenderKeyDistributionMessage.create(
+        sender,
+        distributionId,
+        aliceStore,
+      );
+
+      return {
+        distributionId: distribution.distributionId(),
+        iteration: distribution.iteration(),
+        plaintext: [...plaintext],
+        chainIdMatches: distribution.chainId() === nextDistribution.chainId(),
+        nextIteration: nextDistribution.iteration(),
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/protocol/ProtocolTest.ts sender-key store API.
+    expect(result).toEqual({
+      distributionId: 'd1d1d1d1-7000-11eb-b32a-33b8a8a487a6',
+      iteration: 0,
+      plaintext: [0x0a, 0x0b, 0x0c],
+      chainIdMatches: true,
+      nextIteration: 1,
+    });
+  });
+});
+
+test.describe('AuthMessagesService.getUploadForm parity', () => {
+  test('matches the upstream Node request shape and parses the upload form', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const encodeJson = (value) => new TextEncoder().encode(JSON.stringify(value));
+      let captured;
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured = {
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers,
+          bodyLength: request.body === null ? 0 : request.body.length,
+        };
+        return {
+          status: 200,
+          message: 'OK',
+          headers: [['content-type', 'application/json']],
+          body: encodeJson({
+            cdn: 123,
+            key: 'abcde',
+            headers: { one: 'val1', two: 'val2' },
+            signedUploadLocation: 'http://example.org/upload',
+          }),
+        };
+      });
+
+      const response = await chat.getUploadForm(42n);
+      const parsed = mod.parseUploadFormResponse(mod.ChatResponse.fromObject(response));
+      return {
+        captured,
+        parsed: {
+          cdn: parsed.cdn,
+          key: parsed.key,
+          headers: [...parsed.headers].sort(([left], [right]) =>
+            left.localeCompare(right),
+          ),
+          signedUploadUrl: parsed.signedUploadUrl,
+        },
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/chat/AuthMessagesServiceTest.ts.
+    expect(result.captured).toEqual({
+      verb: 'GET',
+      path: '/v4/attachments/form/upload?uploadLength=42',
+      headers: [],
+      bodyLength: 0,
+    });
+    expect(result.parsed).toEqual({
+      cdn: 123,
+      key: 'abcde',
+      headers: [
+        ['one', 'val1'],
+        ['two', 'val2'],
+      ],
+      signedUploadUrl: 'http://example.org/upload',
+    });
+  });
+});
+
+test.describe('UnauthUsernamesService parity', () => {
+  test('looks up username hashes and links using upstream fixtures', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const encodeJson = (value) => new TextEncoder().encode(JSON.stringify(value));
+      const bytesFromHex = (hex) => {
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i += 1) {
+          bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+      };
+
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({ verb: request.verb, path: request.path });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+
+      const hash = Uint8Array.of(1, 2, 3, 4);
+      await chat.lookUpUsernameHash(hash);
+
+      const aci = '4fcfe887-a600-40cd-9ab7-fd2a695e9981';
+      const parsedHash = mod.parseLookUpUsernameHashResponse(
+        new mod.ChatResponse(200, 'OK', encodeJson({ uuid: aci })),
+      );
+      const hash404 = mod.parseLookUpUsernameHashResponse(
+        new mod.ChatResponse(404, 'Not Found', null),
+      );
+
+      const linkUuid = '00000000-0000-0000-0000-000000000000';
+      await chat.lookUpUsernameLink(linkUuid);
+
+      const encryptedUsername =
+        'kj5ah-VbEgjpfJsNt-Wto2H626DRmJSVpYPy0yPOXA8kiSFkBCD8ysFlJ-Z3MhiAnt_R3Nm7ZY0W5fiRDLVbhaE2z-KO2xdf5NcVbkewCzhvveecS3hHskDp1aSfbvwTZNNGPmAuKWvJ1MPdHzsF0w';
+      const entropy = bytesFromHex(
+        '4302c613c092a51c5394becffeb6f697300a605348e93f03c3db95e0b03d28f1',
+      );
+      const parsedLink = mod.parseLookUpUsernameLinkResponse(
+        new mod.ChatResponse(
+          200,
+          'OK',
+          encodeJson({ usernameLinkEncryptedValue: encryptedUsername }),
+        ),
+        entropy,
+      );
+      const link404 = mod.parseLookUpUsernameLinkResponse(
+        new mod.ChatResponse(404, 'Not Found', null),
+        entropy,
+      );
+
+      return {
+        captured,
+        parsedHashUuid: parsedHash.getRawUuid(),
+        hash404,
+        parsedLink: {
+          username: parsedLink.username,
+          hashLength: parsedLink.hash.length,
+        },
+        link404,
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/chat/UnauthUsernamesServiceTest.ts.
+    expect(result.captured).toEqual([
+      { verb: 'GET', path: '/v1/accounts/username_hash/AQIDBA' },
+      {
+        verb: 'GET',
+        path: '/v1/accounts/username_link/00000000-0000-0000-0000-000000000000',
+      },
+    ]);
+    expect(result.parsedHashUuid).toBe('4fcfe887-a600-40cd-9ab7-fd2a695e9981');
+    expect(result.hash404).toBeNull();
+    expect(result.parsedLink).toEqual({ username: 'moxie.01', hashLength: 32 });
+    expect(result.link404).toBeNull();
+  });
+});
+
+test.describe('UnauthProfilesService.accountExists parity', () => {
+  test('matches upstream account existence requests and status parsing', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({ verb: request.verb, path: request.path });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      const aci = mod.Aci.fromUuid('9d0652a3-dcc3-4d11-975f-74d61598733f');
+      const pni = mod.Pni.fromUuid('796abedb-ca4e-4f18-8803-1fde5b921f9f');
+      await chat.accountExists(aci);
+      await chat.accountExists(pni);
+
+      return {
+        captured,
+        exists: mod.parseAccountExistsResponse(new mod.ChatResponse(200, 'OK', null)),
+        missing: mod.parseAccountExistsResponse(
+          new mod.ChatResponse(404, 'Not Found', null),
+        ),
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/chat/UnauthProfilesServiceTest.ts.
+    expect(result.captured).toEqual([
+      {
+        verb: 'HEAD',
+        path: '/v1/accounts/account/9d0652a3-dcc3-4d11-975f-74d61598733f',
+      },
+      {
+        verb: 'HEAD',
+        path: '/v1/accounts/account/PNI:796abedb-ca4e-4f18-8803-1fde5b921f9f',
+      },
+    ]);
+    expect(result.exists).toBe(true);
+    expect(result.missing).toBe(false);
+  });
+});
+
+test.describe('UnauthBackupsService upload-form parity', () => {
+  test('matches backup and media upload request paths and auth headers', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const bytesFromBase64 = (value) =>
+        Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+      const credential = new mod.BackupAuthCredential(
+        bytesFromBase64(
+          'AACkl2kAAAAAyQAAAAAAAAACAAAAAAAAAMUH8mZNP0qDpXFbK2e3dKL04Zw1UhyJ5ab+RlRLhAYELu5/fvwOhxzvxcnNGpqppkGOWc7SSN0kEU0MMIslejR+FDPRx0BWeRTeMmr2ngFVaHUjmazUmgCAPkr0BuLjShTidN9UW8r2M6FjodEtF/8=',
+        ),
+      );
+      const serverParams = new mod.GenericServerPublicParams(
+        bytesFromBase64(
+          'AIRCHmMrkZXZ9ZuwKJkA0GeMOaDSdVsU26AghADhY3l5XBYwf0UCtm2tvvYsbnPgh9uIUyERm0Wg3v7pFtg+OEfsM6fwjdBFqAgfeqs1pT9nwp2Wp6oGdAfCTrGcqraXJoyAiwAh3vogu7ltucNKh25zKiOkIeIEJNrjbx2eEwkFnqLYuk/noxaOi2Zl7R5d7+vn0Me0d2AZhu0Uuk1vpTIuYf+X4UJXV/N5TYYxwOe/OQHu4zZmdaPjtPN1EHFJC5ALV+8BY9dN5ddS7iTL1uq1ksURAA9hAZzC9/aTr7J7',
+        ),
+      );
+      const signingKey = mod.PrivateKey.deserialize(
+        bytesFromBase64('KMhdmPEusAwoT3C2LzIbmGX6z+3HMbhgbrXmUwRfGF0='),
+      );
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        const headers = Object.fromEntries(request.headers);
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          hasPresentation: Boolean(headers['x-signal-zk-auth']),
+          hasSignature: Boolean(headers['x-signal-zk-auth-signature']),
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+
+      await chat.getBackupUploadForm(12345n, credential, serverParams, signingKey);
+      await chat.getBackupMediaUploadForm(12345n, credential, serverParams, signingKey);
+      return captured;
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/chat/UnauthBackupsServiceUploadTest.ts.
+    expect(result).toEqual([
+      {
+        verb: 'GET',
+        path: '/v1/archives/upload/form?uploadLength=12345',
+        hasPresentation: true,
+        hasSignature: true,
+      },
+      {
+        verb: 'GET',
+        path: '/v1/archives/media/upload/form?uploadLength=12345',
+        hasPresentation: true,
+        hasSignature: true,
+      },
+    ]);
+  });
+});
+
+test.describe('UnauthMessagesService request parity', () => {
+  test('matches sealed-sender and multi-recipient request shapes', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers,
+          body:
+            request.body === null
+              ? null
+              : request.headers.some(
+                    ([name, value]) =>
+                      name === 'content-type' &&
+                      value === 'application/vnd.signal-messenger.mrm',
+                  )
+                ? [...request.body]
+                : JSON.parse(new TextDecoder().decode(request.body)),
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      const recipient = mod.Aci.fromUuid('4fcfe887-a600-40cd-9ab7-fd2a695e9981');
+      const messages = [
+        { deviceId: 1, registrationId: 11, contents: Uint8Array.of(1, 2, 3) },
+        { deviceId: 2, registrationId: 22, contents: Uint8Array.of(4, 5, 6) },
+      ];
+
+      await chat.sendSealedSenderMessage(
+        recipient,
+        1700000000000,
+        messages,
+        'story',
+        null,
+        false,
+        true,
+      );
+      await chat.sendSealedSenderMessage(
+        recipient,
+        1700000000000,
+        messages,
+        'accessKey',
+        new Uint8Array(16).fill(0x0a),
+        false,
+        true,
+      );
+      await chat.sendSealedSenderMessage(
+        recipient,
+        1700000000000,
+        messages,
+        'unrestricted',
+        null,
+        false,
+        true,
+      );
+      await chat.sendMultiRecipientMessage(
+        Uint8Array.of(1, 2, 3, 4),
+        1700000000000,
+        'story',
+        null,
+        false,
+        true,
+      );
+
+      return captured;
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/chat/UnauthMessagesServiceTest.ts.
+    expect(result).toEqual([
+      {
+        verb: 'PUT',
+        path: '/v1/messages/4fcfe887-a600-40cd-9ab7-fd2a695e9981?story=true',
+        headers: [['content-type', 'application/json']],
+        body: {
+          messages: [
+            {
+              type: 6,
+              destinationDeviceId: 1,
+              destinationRegistrationId: 11,
+              content: 'AQID',
+            },
+            {
+              type: 6,
+              destinationDeviceId: 2,
+              destinationRegistrationId: 22,
+              content: 'BAUG',
+            },
+          ],
+          online: false,
+          urgent: true,
+          timestamp: 1700000000000,
+        },
+      },
+      {
+        verb: 'PUT',
+        path: '/v1/messages/4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+        headers: [
+          ['content-type', 'application/json'],
+          ['unidentified-access-key', 'CgoKCgoKCgoKCgoKCgoKCg=='],
+        ],
+        body: {
+          messages: [
+            {
+              type: 6,
+              destinationDeviceId: 1,
+              destinationRegistrationId: 11,
+              content: 'AQID',
+            },
+            {
+              type: 6,
+              destinationDeviceId: 2,
+              destinationRegistrationId: 22,
+              content: 'BAUG',
+            },
+          ],
+          online: false,
+          urgent: true,
+          timestamp: 1700000000000,
+        },
+      },
+      {
+        verb: 'PUT',
+        path: '/v1/messages/4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+        headers: [
+          ['content-type', 'application/json'],
+          ['unidentified-access-key', 'AAAAAAAAAAAAAAAAAAAAAA=='],
+        ],
+        body: {
+          messages: [
+            {
+              type: 6,
+              destinationDeviceId: 1,
+              destinationRegistrationId: 11,
+              content: 'AQID',
+            },
+            {
+              type: 6,
+              destinationDeviceId: 2,
+              destinationRegistrationId: 22,
+              content: 'BAUG',
+            },
+          ],
+          online: false,
+          urgent: true,
+          timestamp: 1700000000000,
+        },
+      },
+      {
+        verb: 'PUT',
+        path: '/v1/messages/multi_recipient?ts=1700000000000&online=false&urgent=true&story=true',
+        headers: [['content-type', 'application/vnd.signal-messenger.mrm']],
+        body: [1, 2, 3, 4],
+      },
+    ]);
+  });
+});
+
+test.describe('AuthMessagesService send request parity', () => {
+  test('matches authenticated send and sync message request shapes', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const encoder = new TextEncoder();
+      const setupCiphertext = () => {
+        const aliceIdentity = mod.PrivateKey.generate();
+        const bobIdentity = mod.PrivateKey.generate();
+        const identityPairFromPrivate = (privateKey) => {
+          const privateKeyBytes = privateKey.serialize();
+          const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+          const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+          return new mod.IdentityKeyPair(publicClone, privateClone);
+        };
+        const aliceStore = new mod.SignalProtocolStore(
+          identityPairFromPrivate(aliceIdentity),
+          5,
+        );
+        const bobStore = new mod.SignalProtocolStore(identityPairFromPrivate(bobIdentity), 5);
+        const aliceAddress = mod.ProtocolAddress.new('+14151111111', 1);
+        const bobAddress = mod.ProtocolAddress.new(
+          '4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+          1,
+        );
+        const bobPreKeyId = 1;
+        const bobPreKey = mod.PrivateKey.generate();
+        const bobSignedPreKeyId = 2;
+        const bobSignedPreKey = mod.PrivateKey.generate();
+        const bobSignedPreKeySignature = bobIdentity.sign(
+          bobSignedPreKey.getPublicKey().serialize(),
+        );
+        const bobKyberPreKeyId = 3;
+        const bobKyberKeyPair = mod.KEMKeyPair.generate();
+        const bobKyberPreKeySignature = bobIdentity.sign(
+          bobKyberKeyPair.getPublicKey().serialize(),
+        );
+        bobStore.savePreKey(
+          bobPreKeyId,
+          mod.PreKeyRecord.new(bobPreKeyId, bobPreKey.getPublicKey(), bobPreKey),
+        );
+        bobStore.saveSignedPreKey(
+          bobSignedPreKeyId,
+          mod.SignedPreKeyRecord.new(
+            bobSignedPreKeyId,
+            42,
+            bobSignedPreKey.getPublicKey(),
+            bobSignedPreKey,
+            bobSignedPreKeySignature,
+          ),
+        );
+        bobStore.saveKyberPreKey(
+          bobKyberPreKeyId,
+          mod.KyberPreKeyRecord.new(
+            bobKyberPreKeyId,
+            42,
+            bobKyberKeyPair,
+            bobKyberPreKeySignature,
+          ),
+        );
+        const bundle = mod.PreKeyBundle.new(
+          5,
+          1,
+          bobPreKeyId,
+          bobPreKey.getPublicKey(),
+          bobSignedPreKeyId,
+          bobSignedPreKey.getPublicKey(),
+          bobSignedPreKeySignature,
+          bobIdentity.getPublicKey(),
+          bobKyberPreKeyId,
+          bobKyberKeyPair.getPublicKey(),
+          bobKyberPreKeySignature,
+        );
+        mod.processPreKeyBundle(bundle, bobAddress, aliceAddress, aliceStore, 42);
+        const preKeyMessage = mod.signalEncrypt(
+          encoder.encode('first'),
+          bobAddress,
+          aliceAddress,
+          aliceStore,
+          43,
+        );
+        mod.signalDecrypt(preKeyMessage, aliceAddress, bobAddress, bobStore);
+        return mod.signalEncrypt(
+          encoder.encode('second'),
+          bobAddress,
+          aliceAddress,
+          aliceStore,
+          44,
+        );
+      };
+
+      const ciphertext = setupCiphertext();
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers,
+          body: JSON.parse(new TextDecoder().decode(request.body)),
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      const destination = mod.Aci.fromUuid('4fcfe887-a600-40cd-9ab7-fd2a695e9981');
+      const contents = [
+        { deviceId: 1, registrationId: 11, contents: ciphertext },
+        { deviceId: 2, registrationId: 22, contents: ciphertext },
+      ];
+      await chat.sendAuthenticatedMessage(
+        destination,
+        1700000000000,
+        contents,
+        false,
+        true,
+      );
+      await chat.sendSyncMessage(destination, 1700000000000, contents, true);
+
+      return captured.map((request) => ({
+        ...request,
+        body: {
+          ...request.body,
+          messages: request.body.messages.map((message) => ({
+            ...message,
+            contentLength: message.content.length,
+            content: '<base64>',
+          })),
+        },
+      }));
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/chat/AuthMessagesServiceTest.ts.
+    expect(result).toEqual([
+      {
+        verb: 'PUT',
+        path: '/v1/messages/4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+        headers: [['content-type', 'application/json']],
+        body: {
+          messages: [
+            {
+              type: 3,
+              destinationDeviceId: 1,
+              destinationRegistrationId: 11,
+              content: '<base64>',
+              contentLength: expect.any(Number),
+            },
+            {
+              type: 3,
+              destinationDeviceId: 2,
+              destinationRegistrationId: 22,
+              content: '<base64>',
+              contentLength: expect.any(Number),
+            },
+          ],
+          online: false,
+          urgent: true,
+          timestamp: 1700000000000,
+        },
+      },
+      {
+        verb: 'PUT',
+        path: '/v1/messages/4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+        headers: [['content-type', 'application/json']],
+        body: {
+          messages: [
+            {
+              type: 3,
+              destinationDeviceId: 1,
+              destinationRegistrationId: 11,
+              content: '<base64>',
+              contentLength: expect.any(Number),
+            },
+            {
+              type: 3,
+              destinationDeviceId: 2,
+              destinationRegistrationId: 22,
+              content: '<base64>',
+              contentLength: expect.any(Number),
+            },
+          ],
+          online: false,
+          urgent: true,
+          timestamp: 1700000000000,
+        },
+      },
+    ]);
+    for (const request of result) {
+      for (const message of request.body.messages) {
+        expect(message.contentLength).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
+test.describe('Registration request and parser parity', () => {
+  test('matches registration session request shapes and response parsers', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const encodeJson = (value) => new TextEncoder().encode(JSON.stringify(value));
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers,
+          body:
+            request.body === null
+              ? null
+              : JSON.parse(new TextDecoder().decode(request.body)),
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      await chat.createRegistrationSession('+18005550123', null, null, null, null);
+      await chat.getRegistrationSession('fake-session-A');
+      await chat.submitRegistrationCaptcha('fake-session-A', 'captcha-token');
+      await chat.requestRegistrationPushChallenge('fake-session-A', 'apn', 'push-token');
+      await chat.submitRegistrationPushChallenge('fake-session-A', 'push-challenge');
+      await chat.requestVerificationCode(
+        'fake-session-A',
+        'voice',
+        'libsignal test',
+        ['fr-CA'],
+      );
+      await chat.submitVerificationCode('fake-session-A', '123456');
+      await chat.checkSvr2Credentials('+18005550123', ['token-a', 'token-b']);
+
+      const session = mod.parseRegistrationSessionResponse(
+        new mod.ChatResponse(
+          200,
+          'OK',
+          encodeJson({
+            allowedToRequestCode: true,
+            verified: false,
+            requestedInformation: ['pushChallenge', 'captcha'],
+            id: 'fake-session-A',
+          }),
+        ),
+      );
+      const svr2 = mod.parseCheckSvr2CredentialsResponse(
+        new mod.ChatResponse(
+          200,
+          'OK',
+          encodeJson({ matches: { 'token-a': 'match', 'token-b': 'no-match' } }),
+        ),
+      );
+
+      return {
+        captured,
+        session: {
+          sessionId: session.sessionId,
+          verified: session.sessionState.verified,
+          allowedToRequestCode: session.sessionState.allowedToRequestCode,
+          requestedInformation: [...session.sessionState.requestedInformation],
+        },
+        svr2,
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/RegistrationTest.ts fake chat remote flow.
+    expect(result.captured).toEqual([
+      {
+        verb: 'POST',
+        path: '/v1/verification/session',
+        headers: [['content-type', 'application/json']],
+        body: { number: '+18005550123' },
+      },
+      {
+        verb: 'GET',
+        path: '/v1/verification/session/fake-session-A',
+        headers: [],
+        body: null,
+      },
+      {
+        verb: 'PATCH',
+        path: '/v1/verification/session/fake-session-A',
+        headers: [['content-type', 'application/json']],
+        body: { captcha: 'captcha-token' },
+      },
+      {
+        verb: 'PATCH',
+        path: '/v1/verification/session/fake-session-A',
+        headers: [['content-type', 'application/json']],
+        body: { pushTokenType: 'apn', pushToken: 'push-token' },
+      },
+      {
+        verb: 'PATCH',
+        path: '/v1/verification/session/fake-session-A',
+        headers: [['content-type', 'application/json']],
+        body: { pushChallenge: 'push-challenge' },
+      },
+      {
+        verb: 'POST',
+        path: '/v1/verification/session/fake-session-A/code',
+        headers: [
+          ['content-type', 'application/json'],
+          ['accept-language', 'fr-CA'],
+        ],
+        body: { transport: 'voice', client: 'libsignal test' },
+      },
+      {
+        verb: 'PUT',
+        path: '/v1/verification/session/fake-session-A/code',
+        headers: [['content-type', 'application/json']],
+        body: { code: '123456' },
+      },
+      {
+        verb: 'POST',
+        path: '/v2/backup/auth/check',
+        headers: [['content-type', 'application/json']],
+        body: { number: '+18005550123', tokens: ['token-a', 'token-b'] },
+      },
+    ]);
+    expect(result.session).toEqual({
+      sessionId: 'fake-session-A',
+      verified: false,
+      allowedToRequestCode: true,
+      requestedInformation: ['pushChallenge', 'captcha'],
+    });
+    expect(result.svr2).toEqual({ 'token-a': 'match', 'token-b': 'no-match' });
+  });
+});
+
+test.describe('Pre-key service parser parity', () => {
+  test('matches getPreKeys request shapes and converts JSON responses into usable bundles', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const encodeJson = (value) => new TextEncoder().encode(JSON.stringify(value));
+      const base64FromBytes = (bytes) =>
+        btoa(String.fromCharCode(...new Uint8Array(bytes)));
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers,
+          body: request.body,
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      const bobServiceId = mod.Aci.fromUuid('4fcfe887-a600-40cd-9ab7-fd2a695e9981');
+      await chat.getPreKeys(
+        bobServiceId,
+        null,
+        'accessKey',
+        new Uint8Array(16).fill(0x0b),
+      );
+      await chat.getPreKeys(bobServiceId, 2, 'groupSend', Uint8Array.of(1, 2, 3));
+      await chat.getPreKeys(bobServiceId, 3, 'unrestricted', null);
+
+      const aliceIdentity = mod.PrivateKey.generate();
+      const bobIdentity = mod.PrivateKey.generate();
+      const aliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      const bobStore = new mod.SignalProtocolStore(identityPairFromPrivate(bobIdentity), 5);
+      const aliceAddress = mod.ProtocolAddress.new('+14151111111', 1);
+      const bobAddress = mod.ProtocolAddress.new(
+        '4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+        1,
+      );
+
+      const preKeyId = 31337;
+      const preKey = mod.PrivateKey.generate();
+      const signedPreKeyId = 22;
+      const signedPreKey = mod.PrivateKey.generate();
+      const signedPreKeySignature = bobIdentity.sign(
+        signedPreKey.getPublicKey().serialize(),
+      );
+      const kyberPreKeyId = 777;
+      const kyberKeyPair = mod.KEMKeyPair.generate();
+      const kyberPreKeySignature = bobIdentity.sign(
+        kyberKeyPair.getPublicKey().serialize(),
+      );
+      bobStore.savePreKey(
+        preKeyId,
+        mod.PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
+      );
+      bobStore.saveSignedPreKey(
+        signedPreKeyId,
+        mod.SignedPreKeyRecord.new(
+          signedPreKeyId,
+          42,
+          signedPreKey.getPublicKey(),
+          signedPreKey,
+          signedPreKeySignature,
+        ),
+      );
+      bobStore.saveKyberPreKey(
+        kyberPreKeyId,
+        mod.KyberPreKeyRecord.new(
+          kyberPreKeyId,
+          42,
+          kyberKeyPair,
+          kyberPreKeySignature,
+        ),
+      );
+
+      const parsed = mod.parseGetPreKeysResponse(
+        new mod.ChatResponse(
+          200,
+          'OK',
+          encodeJson({
+            identityKey: base64FromBytes(bobIdentity.getPublicKey().serialize()),
+            devices: [
+              {
+                deviceId: 1,
+                registrationId: 5,
+                preKey: {
+                  keyId: preKeyId,
+                  publicKey: base64FromBytes(preKey.getPublicKey().serialize()),
+                },
+                signedPreKey: {
+                  keyId: signedPreKeyId,
+                  publicKey: base64FromBytes(signedPreKey.getPublicKey().serialize()),
+                  signature: base64FromBytes(signedPreKeySignature),
+                },
+                pqPreKey: {
+                  keyId: kyberPreKeyId,
+                  publicKey: base64FromBytes(kyberKeyPair.getPublicKey().serialize()),
+                  signature: base64FromBytes(kyberPreKeySignature),
+                },
+              },
+            ],
+          }),
+        ),
+      );
+      const [bundle] = parsed.preKeyBundles;
+      mod.processPreKeyBundle(bundle, bobAddress, aliceAddress, aliceStore, 42);
+      const ciphertext = mod.signalEncrypt(
+        encoder.encode('pre-key parser smoke'),
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        43,
+      );
+      const plaintext = mod.signalDecrypt(
+        ciphertext,
+        aliceAddress,
+        bobAddress,
+        bobStore,
+      );
+
+      return {
+        captured,
+        identityMatches:
+          base64FromBytes(parsed.identityKey.serialize()) ===
+          base64FromBytes(bobIdentity.getPublicKey().serialize()),
+        bundle: {
+          registrationId: bundle.registrationId(),
+          deviceId: bundle.deviceId(),
+          preKeyId: bundle.preKeyId(),
+          signedPreKeyId: bundle.signedPreKeyId(),
+          kyberPreKeyId: bundle.kyberPreKeyId(),
+        },
+        decrypted: decoder.decode(plaintext),
+      };
+    });
+
+    expect(result.captured).toEqual([
+      {
+        verb: 'GET',
+        path: '/v2/keys/4fcfe887-a600-40cd-9ab7-fd2a695e9981/*',
+        headers: [['unidentified-access-key', 'CwsLCwsLCwsLCwsLCwsLCw==']],
+        body: null,
+      },
+      {
+        verb: 'GET',
+        path: '/v2/keys/4fcfe887-a600-40cd-9ab7-fd2a695e9981/2',
+        headers: [['group-send-token', 'AQID']],
+        body: null,
+      },
+      {
+        verb: 'GET',
+        path: '/v2/keys/4fcfe887-a600-40cd-9ab7-fd2a695e9981/3',
+        headers: [['unidentified-access-key', 'AAAAAAAAAAAAAAAAAAAAAA==']],
+        body: null,
+      },
+    ]);
+    expect(result.identityMatches).toBe(true);
+    expect(result.bundle).toEqual({
+      registrationId: 5,
+      deviceId: 1,
+      preKeyId: 31337,
+      signedPreKeyId: 22,
+      kyberPreKeyId: 777,
+    });
+    expect(result.decrypted).toBe('pre-key parser smoke');
+  });
+});
+
+test.describe('Registration account parity', () => {
+  test('matches registerAccount request shape and response parser', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const encodeJson = (value) => new TextEncoder().encode(JSON.stringify(value));
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers,
+          body: JSON.parse(new TextDecoder().decode(request.body)),
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      const makeSignedPreKey = (identity, keyId) => {
+        const privateKey = mod.PrivateKey.generate();
+        const publicKey = privateKey.getPublicKey();
+        return {
+          keyId,
+          publicKey,
+          signature: identity.sign(publicKey.serialize()),
+        };
+      };
+      const makeKyberPreKey = (identity, keyId) => {
+        const keyPair = mod.KEMKeyPair.generate();
+        const publicKey = keyPair.getPublicKey();
+        return {
+          keyId,
+          publicKey,
+          signature: identity.sign(publicKey.serialize()),
+        };
+      };
+      const aciIdentity = mod.PrivateKey.generate();
+      const pniIdentity = mod.PrivateKey.generate();
+      const accountAttributes = {
+        recoveryPassword: Uint8Array.from([1, 2, 3, 4]),
+        unidentifiedAccessKey: new Uint8Array(16).fill(0x09),
+        registrationId: 111,
+        pniRegistrationId: 222,
+        registrationLock: 'registration-lock',
+        discoverableByPhoneNumber: false,
+        unrestrictedUnidentifiedAccess: true,
+        capabilities: ['gv2', 'senderKey'],
+        name: new TextEncoder().encode('browser device'),
+      };
+
+      await chat.registerAccount(
+        '+18005550123',
+        'account-password',
+        'fake-session-A',
+        null,
+        true,
+        true,
+        null,
+        null,
+        accountAttributes,
+        aciIdentity.getPublicKey(),
+        pniIdentity.getPublicKey(),
+        makeSignedPreKey(aciIdentity, 10),
+        makeSignedPreKey(pniIdentity, 11),
+        makeKyberPreKey(aciIdentity, 20),
+        makeKyberPreKey(pniIdentity, 21),
+      );
+
+      const parsed = mod.parseRegisterAccountResponse(
+        new mod.ChatResponse(
+          200,
+          'OK',
+          encodeJson({
+            uuid: '4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+            pni: '796abedb-ca4e-4f18-8803-1fde5b921f9f',
+            number: '+18005550123',
+            usernameHash: 'AQIDBA==',
+            usernameLinkHandle: '00000000-0000-0000-0000-000000000000',
+            storageCapable: true,
+            entitlements: {
+              badges: [
+                {
+                  id: 'BOOST',
+                  visible: true,
+                  expirationSeconds: 12345,
+                },
+              ],
+              backup: {
+                backupLevel: 200,
+                expirationSeconds: 67890,
+              },
+            },
+            reregistration: false,
+          }),
+        ),
+      );
+
+      return {
+        captured: captured.map((request) => ({
+          ...request,
+          headers: request.headers.map(([name, value]) => [
+            name,
+            name === 'authorization' ? '<basic>' : value,
+          ]),
+          body: {
+            ...request.body,
+            aciIdentityKeyLength: request.body.aciIdentityKey.length,
+            pniIdentityKeyLength: request.body.pniIdentityKey.length,
+            aciIdentityKey: '<base64>',
+            pniIdentityKey: '<base64>',
+            aciSignedPreKey: {
+              ...request.body.aciSignedPreKey,
+              publicKey: '<base64>',
+              signatureLength: request.body.aciSignedPreKey.signature.length,
+              signature: '<base64>',
+            },
+            pniSignedPreKey: {
+              ...request.body.pniSignedPreKey,
+              publicKey: '<base64>',
+              signatureLength: request.body.pniSignedPreKey.signature.length,
+              signature: '<base64>',
+            },
+            aciPqLastResortPreKey: {
+              ...request.body.aciPqLastResortPreKey,
+              publicKeyLength: request.body.aciPqLastResortPreKey.publicKey.length,
+              publicKey: '<base64>',
+              signatureLength: request.body.aciPqLastResortPreKey.signature.length,
+              signature: '<base64>',
+            },
+            pniPqLastResortPreKey: {
+              ...request.body.pniPqLastResortPreKey,
+              publicKeyLength: request.body.pniPqLastResortPreKey.publicKey.length,
+              publicKey: '<base64>',
+              signatureLength: request.body.pniPqLastResortPreKey.signature.length,
+              signature: '<base64>',
+            },
+          },
+        })),
+        parsed: {
+          aci: parsed.aci.getRawUuid(),
+          uuid: parsed.uuid,
+          pni: parsed.pni.getRawUuid(),
+          number: parsed.number,
+          usernameHash: [...parsed.usernameHash],
+          usernameLinkHandle: parsed.usernameLinkHandle,
+          storageCapable: parsed.storageCapable,
+          reregistration: parsed.reregistration,
+          badge: {
+            id: parsed.entitlements.badges[0].id,
+            visible: parsed.entitlements.badges[0].visible,
+            expirationSeconds:
+              parsed.entitlements.badges[0].expirationSeconds.toString(),
+          },
+          backup: {
+            backupLevel: parsed.entitlements.backup.backupLevel.toString(),
+            expirationSeconds:
+              parsed.entitlements.backup.expirationSeconds.toString(),
+          },
+        },
+      };
+    });
+
+    expect(result.captured).toHaveLength(1);
+    expect(result.captured[0]).toEqual({
+      verb: 'POST',
+      path: '/v1/registration',
+      headers: [
+        ['content-type', 'application/json'],
+        ['authorization', '<basic>'],
+      ],
+      body: {
+        accountAttributes: {
+          capabilities: { gv2: true, senderKey: true },
+          discoverableByPhoneNumber: false,
+          fetchesMessages: true,
+          pniRegistrationId: 222,
+          recoveryPassword: 'AQIDBA==',
+          registrationId: 111,
+          registrationLock: 'registration-lock',
+          unidentifiedAccessKey: new Array(16).fill(9),
+          unrestrictedUnidentifiedAccess: true,
+          name: 'YnJvd3NlciBkZXZpY2U=',
+        },
+        aciIdentityKeyLength: expect.any(Number),
+        pniIdentityKeyLength: expect.any(Number),
+        aciIdentityKey: '<base64>',
+        pniIdentityKey: '<base64>',
+        aciSignedPreKey: {
+          keyId: 10,
+          publicKey: '<base64>',
+          signature: '<base64>',
+          signatureLength: expect.any(Number),
+        },
+        pniSignedPreKey: {
+          keyId: 11,
+          publicKey: '<base64>',
+          signature: '<base64>',
+          signatureLength: expect.any(Number),
+        },
+        aciPqLastResortPreKey: {
+          keyId: 20,
+          publicKey: '<base64>',
+          publicKeyLength: expect.any(Number),
+          signature: '<base64>',
+          signatureLength: expect.any(Number),
+        },
+        pniPqLastResortPreKey: {
+          keyId: 21,
+          publicKey: '<base64>',
+          publicKeyLength: expect.any(Number),
+          signature: '<base64>',
+          signatureLength: expect.any(Number),
+        },
+        skipDeviceTransfer: true,
+        sessionId: 'fake-session-A',
+      },
+    });
+    expect(result.captured[0].body.aciIdentityKeyLength).toBeGreaterThan(0);
+    expect(result.captured[0].body.pniIdentityKeyLength).toBeGreaterThan(0);
+    expect(result.captured[0].body.aciSignedPreKey.signatureLength).toBeGreaterThan(0);
+    expect(result.captured[0].body.pniSignedPreKey.signatureLength).toBeGreaterThan(0);
+    expect(result.captured[0].body.aciPqLastResortPreKey.publicKeyLength).toBeGreaterThan(0);
+    expect(result.captured[0].body.pniPqLastResortPreKey.publicKeyLength).toBeGreaterThan(0);
+    expect(result.parsed).toEqual({
+      aci: '4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+      uuid: '4fcfe887-a600-40cd-9ab7-fd2a695e9981',
+      pni: '796abedb-ca4e-4f18-8803-1fde5b921f9f',
+      number: '+18005550123',
+      usernameHash: [1, 2, 3, 4],
+      usernameLinkHandle: '00000000-0000-0000-0000-000000000000',
+      storageCapable: true,
+      reregistration: false,
+      badge: {
+        id: 'BOOST',
+        visible: true,
+        expirationSeconds: '12345',
+      },
+      backup: {
+        backupLevel: '200',
+        expirationSeconds: '67890',
+      },
+    });
+  });
+
+  test('covers recovery-password, push-token, and invalid registration variants', async ({ page }) => {
+    const result = await runWasm(page, async (mod) => {
+      const captured = [];
+      const chat = new mod.BrowserChatConnection((request) => {
+        captured.push({
+          verb: request.verb,
+          path: request.path,
+          headers: request.headers.map(([name, value]) => [
+            name,
+            name === 'authorization' ? '<basic>' : value,
+          ]),
+          body: JSON.parse(new TextDecoder().decode(request.body)),
+        });
+        return { status: 200, message: 'OK', headers: [], body: null };
+      });
+      const captureAsyncError = async (callback) => {
+        try {
+          await callback();
+          return null;
+        } catch (error) {
+          return error.message;
+        }
+      };
+      const makeSignedPreKey = (identity, keyId) => {
+        const privateKey = mod.PrivateKey.generate();
+        const publicKey = privateKey.getPublicKey();
+        return {
+          keyId,
+          publicKey,
+          signature: identity.sign(publicKey.serialize()),
+        };
+      };
+      const makeKyberPreKey = (identity, keyId) => {
+        const keyPair = mod.KEMKeyPair.generate();
+        const publicKey = keyPair.getPublicKey();
+        return {
+          keyId,
+          publicKey,
+          signature: identity.sign(publicKey.serialize()),
+        };
+      };
+      const makeArgs = ({ sessionId = 'fake-session-A', fetchesMessages = true } = {}) => {
+        const aciIdentity = mod.PrivateKey.generate();
+        const pniIdentity = mod.PrivateKey.generate();
+        const accountAttributes = {
+          recoveryPassword: Uint8Array.from([1, 2, 3, 4]),
+          unidentifiedAccessKey: new Uint8Array(16).fill(0x09),
+          registrationId: 111,
+          pniRegistrationId: 222,
+          discoverableByPhoneNumber: true,
+          unrestrictedUnidentifiedAccess: false,
+          capabilities: ['gv2'],
+        };
+        return [
+          '+18005550123',
+          'account-password',
+          sessionId,
+          null,
+          false,
+          fetchesMessages,
+          null,
+          null,
+          accountAttributes,
+          aciIdentity.getPublicKey(),
+          pniIdentity.getPublicKey(),
+          makeSignedPreKey(aciIdentity, 10),
+          makeSignedPreKey(pniIdentity, 11),
+          makeKyberPreKey(aciIdentity, 20),
+          makeKyberPreKey(pniIdentity, 21),
+        ];
+      };
+
+      const recoveryArgs = makeArgs({ sessionId: null, fetchesMessages: false });
+      recoveryArgs[3] = Uint8Array.from([5, 6, 7, 8]);
+      recoveryArgs[6] = 'fcm';
+      recoveryArgs[7] = 'push-token';
+      await chat.registerAccount(...recoveryArgs);
+
+      const missingPushArgs = makeArgs({ fetchesMessages: false });
+      const invalidPushArgs = makeArgs({ fetchesMessages: false });
+      invalidPushArgs[6] = 'web-push';
+      invalidPushArgs[7] = 'push-token';
+      const sessionAndRecoveryArgs = makeArgs();
+      sessionAndRecoveryArgs[3] = Uint8Array.of(1, 2, 3, 4);
+
+      return {
+        captured: captured.map((request) => ({
+          ...request,
+          body: {
+            ...request.body,
+            aciIdentityKey: '<base64>',
+            pniIdentityKey: '<base64>',
+            aciSignedPreKey: {
+              ...request.body.aciSignedPreKey,
+              publicKey: '<base64>',
+              signature: '<base64>',
+            },
+            pniSignedPreKey: {
+              ...request.body.pniSignedPreKey,
+              publicKey: '<base64>',
+              signature: '<base64>',
+            },
+            aciPqLastResortPreKey: {
+              ...request.body.aciPqLastResortPreKey,
+              publicKey: '<base64>',
+              signature: '<base64>',
+            },
+            pniPqLastResortPreKey: {
+              ...request.body.pniPqLastResortPreKey,
+              publicKey: '<base64>',
+              signature: '<base64>',
+            },
+          },
+        })),
+        missingPush: await captureAsyncError(() =>
+          chat.registerAccount(...missingPushArgs),
+        ),
+        invalidPushType: await captureAsyncError(() =>
+          chat.registerAccount(...invalidPushArgs),
+        ),
+        sessionAndRecovery: await captureAsyncError(() =>
+          chat.registerAccount(...sessionAndRecoveryArgs),
+        ),
+      };
+    });
+
+    expect(result.captured).toHaveLength(1);
+    expect(result.captured[0]).toMatchObject({
+      verb: 'POST',
+      path: '/v1/registration',
+      headers: [
+        ['content-type', 'application/json'],
+        ['authorization', '<basic>'],
+      ],
+      body: {
+        accountAttributes: {
+          capabilities: { gv2: true },
+          discoverableByPhoneNumber: true,
+          fetchesMessages: false,
+          pniRegistrationId: 222,
+          recoveryPassword: 'AQIDBA==',
+          registrationId: 111,
+          unidentifiedAccessKey: new Array(16).fill(9),
+          unrestrictedUnidentifiedAccess: false,
+        },
+        recoveryPassword: 'BQYHCA==',
+        pushToken: { gcmRegistrationId: 'push-token' },
+        skipDeviceTransfer: false,
+      },
+    });
+    expect(result.captured[0].body.sessionId).toBeUndefined();
+    expect(result.missingPush).toContain(
+      'push token is required unless fetchesMessages is true',
+    );
+    expect(result.invalidPushType).toContain('push token type must be apn or fcm');
+    expect(result.sessionAndRecovery).toContain(
+      'top-level recovery password must be null when session ID is set',
+    );
+  });
+});
+
+test.describe('Sealed sender protocol parity', () => {
+  test('encrypts/decrypts sealed-sender messages and USMC content in Chromium', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+      const randomPublicKey = () => mod.PrivateKey.generate().getPublicKey();
+
+      const aliceIdentity = mod.PrivateKey.generate();
+      const bobIdentity = mod.PrivateKey.generate();
+      const aliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      const bobStore = new mod.SignalProtocolStore(identityPairFromPrivate(bobIdentity), 5);
+      const aliceE164 = '+14151111111';
+      const bobE164 = '+19192222222';
+      const aliceUuid = '9d0652a3-dcc3-4d11-975f-74d61598733f';
+      const bobUuid = '796abedb-ca4e-4f18-8803-1fde5b921f9f';
+      const aliceDeviceId = 1;
+      const bobDeviceId = 3;
+      const aliceAddress = mod.ProtocolAddress.new(aliceUuid, aliceDeviceId);
+      const bobAddress = mod.ProtocolAddress.new(bobUuid, bobDeviceId);
+
+      const trustRoot = mod.PrivateKey.generate();
+      const serverKey = mod.PrivateKey.generate();
+      const serverCert = mod.ServerCertificate.new(
+        1,
+        serverKey.getPublicKey(),
+        trustRoot,
+      );
+      const senderCert = mod.SenderCertificate.new(
+        aliceUuid,
+        aliceE164,
+        aliceDeviceId,
+        aliceIdentity.getPublicKey(),
+        1605722925000,
+        serverCert,
+        serverKey,
+      );
+
+      const preKeyId = 31337;
+      const preKey = mod.PrivateKey.generate();
+      const signedPreKeyId = 22;
+      const signedPreKey = mod.PrivateKey.generate();
+      const signedPreKeySignature = bobIdentity.sign(
+        signedPreKey.getPublicKey().serialize(),
+      );
+      const kyberPreKeyId = 777;
+      const kyberKeyPair = mod.KEMKeyPair.generate();
+      const kyberPreKeySignature = bobIdentity.sign(
+        kyberKeyPair.getPublicKey().serialize(),
+      );
+      const bundle = mod.PreKeyBundle.new(
+        5,
+        bobDeviceId,
+        preKeyId,
+        preKey.getPublicKey(),
+        signedPreKeyId,
+        signedPreKey.getPublicKey(),
+        signedPreKeySignature,
+        bobIdentity.getPublicKey(),
+        kyberPreKeyId,
+        kyberKeyPair.getPublicKey(),
+        kyberPreKeySignature,
+      );
+      bobStore.savePreKey(
+        preKeyId,
+        mod.PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
+      );
+      bobStore.saveSignedPreKey(
+        signedPreKeyId,
+        mod.SignedPreKeyRecord.new(
+          signedPreKeyId,
+          42,
+          signedPreKey.getPublicKey(),
+          signedPreKey,
+          signedPreKeySignature,
+        ),
+      );
+      bobStore.saveKyberPreKey(
+        kyberPreKeyId,
+        mod.KyberPreKeyRecord.new(
+          kyberPreKeyId,
+          42,
+          kyberKeyPair,
+          kyberPreKeySignature,
+        ),
+      );
+      mod.processPreKeyBundle(bundle, bobAddress, aliceAddress, aliceStore, 42);
+
+      const plaintext = encoder.encode('sealed sender browser parity');
+      const sealedMessage = mod.sealedSenderEncryptMessage(
+        plaintext,
+        bobAddress,
+        senderCert,
+        aliceStore,
+        43,
+      );
+      const decrypted = mod.sealedSenderDecryptMessage(
+        sealedMessage,
+        trustRoot.getPublicKey(),
+        43,
+        bobE164,
+        bobUuid,
+        bobDeviceId,
+        bobStore,
+      );
+
+      const innerMessage = mod.signalEncrypt(
+        encoder.encode('sealed sender content hint'),
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        44,
+      );
+      const content = mod.UnidentifiedSenderMessageContent.new(
+        innerMessage,
+        senderCert,
+        mod.ContentHint.Resendable,
+        Uint8Array.of(1, 2, 3, 4),
+      );
+      const contentCiphertext = mod.sealedSenderEncrypt(content, bobAddress, aliceStore);
+      const decryptedContent = mod.sealedSenderDecryptToUsmc(
+        contentCiphertext,
+        bobStore,
+      );
+      const decryptedSender = decryptedContent.senderCertificate();
+
+      return {
+        message: decoder.decode(decrypted.message()),
+        senderE164: decrypted.senderE164(),
+        senderUuid: decrypted.senderUuid(),
+        senderAci: decrypted.senderAci().getRawUuid(),
+        deviceId: decrypted.deviceId(),
+        certificateValid: senderCert.validate(trustRoot.getPublicKey(), 31335),
+        certificateValidWithRoots: senderCert.validateWithTrustRoots(
+          [randomPublicKey(), trustRoot.getPublicKey(), randomPublicKey()],
+          31335,
+        ),
+        certificateInvalidWithWrongRoots: senderCert.validateWithTrustRoots(
+          [randomPublicKey(), randomPublicKey()],
+          31335,
+        ),
+        contentHint: decryptedContent.contentHint(),
+        groupId: [...decryptedContent.groupId()],
+        contentSender: {
+          e164: decryptedSender.senderE164(),
+          uuid: decryptedSender.senderUuid(),
+          deviceId: decryptedSender.senderDeviceId(),
+        },
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/protocol/SealedSenderTest.ts 1:1 coverage.
+    expect(result).toEqual({
+      message: 'sealed sender browser parity',
+      senderE164: '+14151111111',
+      senderUuid: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+      senderAci: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+      deviceId: 1,
+      certificateValid: true,
+      certificateValidWithRoots: true,
+      certificateInvalidWithWrongRoots: false,
+      contentHint: 1,
+      groupId: [1, 2, 3, 4],
+      contentSender: {
+        e164: '+14151111111',
+        uuid: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        deviceId: 1,
+      },
+    });
+  });
+
+  test('encrypts multi-recipient sealed-sender content and decrypts the extracted recipient message', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+
+      const aliceIdentity = mod.PrivateKey.generate();
+      const bobIdentity = mod.PrivateKey.generate();
+      const aliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      const bobStore = new mod.SignalProtocolStore(identityPairFromPrivate(bobIdentity), 5);
+      const aliceE164 = '+14151111111';
+      const aliceUuid = '9d0652a3-dcc3-4d11-975f-74d61598733f';
+      const bobUuid = '796abedb-ca4e-4f18-8803-1fde5b921f9f';
+      const aliceDeviceId = 1;
+      const bobDeviceId = 3;
+      const aliceAddress = mod.ProtocolAddress.new(aliceUuid, aliceDeviceId);
+      const bobAddress = mod.ProtocolAddress.new(bobUuid, bobDeviceId);
+
+      const trustRoot = mod.PrivateKey.generate();
+      const serverKey = mod.PrivateKey.generate();
+      const serverCert = mod.ServerCertificate.new(
+        1,
+        serverKey.getPublicKey(),
+        trustRoot,
+      );
+      const senderCert = mod.SenderCertificate.new(
+        aliceUuid,
+        aliceE164,
+        aliceDeviceId,
+        aliceIdentity.getPublicKey(),
+        1605722925000,
+        serverCert,
+        serverKey,
+      );
+
+      const preKeyId = 31337;
+      const preKey = mod.PrivateKey.generate();
+      const signedPreKeyId = 22;
+      const signedPreKey = mod.PrivateKey.generate();
+      const signedPreKeySignature = bobIdentity.sign(
+        signedPreKey.getPublicKey().serialize(),
+      );
+      const kyberPreKeyId = 777;
+      const kyberKeyPair = mod.KEMKeyPair.generate();
+      const kyberPreKeySignature = bobIdentity.sign(
+        kyberKeyPair.getPublicKey().serialize(),
+      );
+      const bundle = mod.PreKeyBundle.new(
+        5,
+        bobDeviceId,
+        preKeyId,
+        preKey.getPublicKey(),
+        signedPreKeyId,
+        signedPreKey.getPublicKey(),
+        signedPreKeySignature,
+        bobIdentity.getPublicKey(),
+        kyberPreKeyId,
+        kyberKeyPair.getPublicKey(),
+        kyberPreKeySignature,
+      );
+      bobStore.savePreKey(
+        preKeyId,
+        mod.PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
+      );
+      bobStore.saveSignedPreKey(
+        signedPreKeyId,
+        mod.SignedPreKeyRecord.new(
+          signedPreKeyId,
+          42,
+          signedPreKey.getPublicKey(),
+          signedPreKey,
+          signedPreKeySignature,
+        ),
+      );
+      bobStore.saveKyberPreKey(
+        kyberPreKeyId,
+        mod.KyberPreKeyRecord.new(
+          kyberPreKeyId,
+          42,
+          kyberKeyPair,
+          kyberPreKeySignature,
+        ),
+      );
+      mod.processPreKeyBundle(bundle, bobAddress, aliceAddress, aliceStore, 42);
+
+      const distributionId = 'd1d1d1d1-7000-11eb-b32a-33b8a8a487a6';
+      const distribution = mod.SenderKeyDistributionMessage.create(
+        aliceAddress,
+        distributionId,
+        aliceStore,
+      );
+      mod.processSenderKeyDistributionMessage(aliceAddress, distribution, bobStore);
+      const groupMessage = encoder.encode('multi-recipient sealed sender group');
+      const groupCiphertext = mod.groupEncrypt(
+        aliceAddress,
+        distributionId,
+        aliceStore,
+        groupMessage,
+      );
+      const content = mod.UnidentifiedSenderMessageContent.new(
+        groupCiphertext,
+        senderCert,
+        mod.ContentHint.Implicit,
+        Uint8Array.of(42),
+      );
+
+      const multiRecipientMessage = mod.sealedSenderMultiRecipientEncrypt(
+        content,
+        [bobAddress],
+        aliceStore,
+        null,
+      );
+      const extractedMessage = mod.sealedSenderMultiRecipientMessageForSingleRecipient(
+        multiRecipientMessage,
+      );
+      const decryptedContent = mod.sealedSenderDecryptToUsmc(
+        extractedMessage,
+        bobStore,
+      );
+      const decryptedSender = decryptedContent.senderCertificate();
+      const decryptedGroupMessage = mod.groupDecrypt(
+        aliceAddress,
+        bobStore,
+        decryptedContent.contents(),
+      );
+
+      return {
+        multiRecipientMessageLength: multiRecipientMessage.length,
+        extractedMessageLength: extractedMessage.length,
+        decryptedGroupMessage: decoder.decode(decryptedGroupMessage),
+        contentHint: decryptedContent.contentHint(),
+        groupId: [...decryptedContent.groupId()],
+        sender: {
+          e164: decryptedSender.senderE164(),
+          uuid: decryptedSender.senderUuid(),
+          deviceId: decryptedSender.senderDeviceId(),
+        },
+      };
+    });
+
+    // Mirrors vendor/libsignal/node/ts/test/protocol/SealedSenderTest.ts multi-recipient flow.
+    expect(result.multiRecipientMessageLength).toBeGreaterThan(0);
+    expect(result.extractedMessageLength).toBeGreaterThan(0);
+    expect(result).toEqual({
+      multiRecipientMessageLength: expect.any(Number),
+      extractedMessageLength: expect.any(Number),
+      decryptedGroupMessage: 'multi-recipient sealed sender group',
+      contentHint: 2,
+      groupId: [42],
+      sender: {
+        e164: '+14151111111',
+        uuid: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        deviceId: 1,
+      },
+    });
+  });
+
+  test('rejects negative sealed-sender and protocol state cases', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const captureError = (callback) => {
+        try {
+          callback();
+          return null;
+        } catch (error) {
+          return error.message;
+        }
+      };
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+      const makePreKeySession = ({
+        aliceIdentity = mod.PrivateKey.generate(),
+        bobIdentity = mod.PrivateKey.generate(),
+        aliceUuid = '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        bobUuid = '796abedb-ca4e-4f18-8803-1fde5b921f9f',
+        aliceDeviceId = 1,
+        bobDeviceId = 3,
+      } = {}) => {
+        const aliceStore = new mod.SignalProtocolStore(
+          identityPairFromPrivate(aliceIdentity),
+          5,
+        );
+        const bobStore = new mod.SignalProtocolStore(
+          identityPairFromPrivate(bobIdentity),
+          5,
+        );
+        const aliceAddress = mod.ProtocolAddress.new(aliceUuid, aliceDeviceId);
+        const bobAddress = mod.ProtocolAddress.new(bobUuid, bobDeviceId);
+        const preKeyId = 31337;
+        const preKey = mod.PrivateKey.generate();
+        const signedPreKeyId = 22;
+        const signedPreKey = mod.PrivateKey.generate();
+        const signedPreKeySignature = bobIdentity.sign(
+          signedPreKey.getPublicKey().serialize(),
+        );
+        const kyberPreKeyId = 777;
+        const kyberKeyPair = mod.KEMKeyPair.generate();
+        const kyberPreKeySignature = bobIdentity.sign(
+          kyberKeyPair.getPublicKey().serialize(),
+        );
+        bobStore.savePreKey(
+          preKeyId,
+          mod.PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
+        );
+        bobStore.saveSignedPreKey(
+          signedPreKeyId,
+          mod.SignedPreKeyRecord.new(
+            signedPreKeyId,
+            42,
+            signedPreKey.getPublicKey(),
+            signedPreKey,
+            signedPreKeySignature,
+          ),
+        );
+        bobStore.saveKyberPreKey(
+          kyberPreKeyId,
+          mod.KyberPreKeyRecord.new(
+            kyberPreKeyId,
+            42,
+            kyberKeyPair,
+            kyberPreKeySignature,
+          ),
+        );
+        mod.processPreKeyBundle(
+          mod.PreKeyBundle.new(
+            5,
+            bobDeviceId,
+            preKeyId,
+            preKey.getPublicKey(),
+            signedPreKeyId,
+            signedPreKey.getPublicKey(),
+            signedPreKeySignature,
+            bobIdentity.getPublicKey(),
+            kyberPreKeyId,
+            kyberKeyPair.getPublicKey(),
+            kyberPreKeySignature,
+          ),
+          bobAddress,
+          aliceAddress,
+          aliceStore,
+          42,
+        );
+        return { aliceIdentity, bobIdentity, aliceStore, bobStore, aliceAddress, bobAddress };
+      };
+
+      const session = makePreKeySession();
+      const trustRoot = mod.PrivateKey.generate();
+      const serverKey = mod.PrivateKey.generate();
+      const senderCert = mod.SenderCertificate.new(
+        '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        '+14151111111',
+        1,
+        session.aliceIdentity.getPublicKey(),
+        1605722925000,
+        mod.ServerCertificate.new(1, serverKey.getPublicKey(), trustRoot),
+        serverKey,
+      );
+      const sealedMessage = mod.sealedSenderEncryptMessage(
+        encoder.encode('negative sealed sender'),
+        session.bobAddress,
+        senderCert,
+        session.aliceStore,
+        43,
+      );
+      const emptyAliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(mod.PrivateKey.generate()),
+        5,
+      );
+
+      const sharedIdentity = mod.PrivateKey.generate();
+      const selfSend = makePreKeySession({
+        aliceIdentity: sharedIdentity,
+        bobIdentity: sharedIdentity,
+        aliceUuid: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        bobUuid: '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        aliceDeviceId: 1,
+        bobDeviceId: 1,
+      });
+      const selfTrustRoot = mod.PrivateKey.generate();
+      const selfServerKey = mod.PrivateKey.generate();
+      const selfSenderCert = mod.SenderCertificate.new(
+        '9d0652a3-dcc3-4d11-975f-74d61598733f',
+        '+14151111111',
+        1,
+        sharedIdentity.getPublicKey(),
+        1605722925000,
+        mod.ServerCertificate.new(1, selfServerKey.getPublicKey(), selfTrustRoot),
+        selfServerKey,
+      );
+      const selfSealedMessage = mod.sealedSenderEncryptMessage(
+        encoder.encode('self send'),
+        selfSend.bobAddress,
+        selfSenderCert,
+        selfSend.aliceStore,
+        43,
+      );
+      const missingSessionContent = mod.UnidentifiedSenderMessageContent.new(
+        mod.signalEncrypt(
+          encoder.encode('missing multi-recipient session'),
+          session.bobAddress,
+          session.aliceAddress,
+          session.aliceStore,
+          44,
+        ),
+        senderCert,
+        mod.ContentHint.Default,
+        null,
+      );
+
+      return {
+        wrongTrustRoot: captureError(() =>
+          mod.sealedSenderDecryptMessage(
+            sealedMessage,
+            mod.PrivateKey.generate().getPublicKey(),
+            43,
+            '+19192222222',
+            '796abedb-ca4e-4f18-8803-1fde5b921f9f',
+            3,
+            session.bobStore,
+          ),
+        ),
+        wrongLocalDevice: captureError(() =>
+          mod.sealedSenderDecryptMessage(
+            sealedMessage,
+            trustRoot.getPublicKey(),
+            43,
+            '+19192222222',
+            '796abedb-ca4e-4f18-8803-1fde5b921f9f',
+            99,
+            session.bobStore,
+          ),
+        ),
+        selfSend: captureError(() =>
+          mod.sealedSenderDecryptMessage(
+            selfSealedMessage,
+            selfTrustRoot.getPublicKey(),
+            43,
+            null,
+            '9d0652a3-dcc3-4d11-975f-74d61598733f',
+            1,
+            selfSend.bobStore,
+          ),
+        ),
+        missingSessionEncrypt: captureError(() =>
+          mod.sealedSenderEncryptMessage(
+            encoder.encode('missing session'),
+            session.bobAddress,
+            senderCert,
+            emptyAliceStore,
+            43,
+          ),
+        ),
+        missingMultiRecipientSession: captureError(() =>
+          mod.sealedSenderMultiRecipientEncrypt(
+            missingSessionContent,
+            [session.bobAddress],
+            emptyAliceStore,
+            null,
+          ),
+        ),
+        corruptSnapshot: captureError(() =>
+          mod.SignalProtocolStore.fromSnapshot(Uint8Array.of(1, 2, 3, 4)),
+        ),
+      };
+    });
+
+    expect(result.wrongTrustRoot).toBeTruthy();
+    expect(result.wrongLocalDevice).toBeTruthy();
+    expect(result.selfSend).toBeTruthy();
+    expect(result.missingSessionEncrypt).toBeTruthy();
+    expect(result.missingMultiRecipientSession).toContain('missing session');
+    expect(result.corruptSnapshot).toBeTruthy();
+  });
+});
+
+test.describe('Browser response parser error parity', () => {
+  test('rejects non-success, missing body, malformed JSON, and invalid base64 responses', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encodeJson = (value) => new TextEncoder().encode(JSON.stringify(value));
+      const captureError = (callback) => {
+        try {
+          callback();
+          return null;
+        } catch (error) {
+          return error.message;
+        }
+      };
+
+      return {
+        getPreKeysStatus: captureError(() =>
+          mod.parseGetPreKeysResponse(new mod.ChatResponse(500, 'Server Error', null)),
+        ),
+        getUploadMissingBody: captureError(() =>
+          mod.parseUploadFormResponse(new mod.ChatResponse(200, 'OK', null)),
+        ),
+        registerMalformedJson: captureError(() =>
+          mod.parseRegisterAccountResponse(
+            new mod.ChatResponse(200, 'OK', new TextEncoder().encode('{')),
+          ),
+        ),
+        usernameHashInvalidUuid: captureError(() =>
+          mod.parseLookUpUsernameHashResponse(
+            new mod.ChatResponse(200, 'OK', encodeJson({ uuid: 'not-a-uuid' })),
+          ),
+        ),
+        usernameLinkBadEntropy: captureError(() =>
+          mod.parseLookUpUsernameLinkResponse(
+            new mod.ChatResponse(
+              200,
+              'OK',
+              encodeJson({ usernameLinkEncryptedValue: 'AQID' }),
+            ),
+            Uint8Array.of(1, 2, 3),
+          ),
+        ),
+        accountExistsStatus: captureError(() =>
+          mod.parseAccountExistsResponse(new mod.ChatResponse(503, 'Unavailable', null)),
+        ),
+        uploadFormBadBase64: captureError(() =>
+          mod.parseGetPreKeysResponse(
+            new mod.ChatResponse(
+              200,
+              'OK',
+              encodeJson({
+                identityKey: 'not base64',
+                devices: [],
+              }),
+            ),
+          ),
+        ),
+        usernameHash404: mod.parseLookUpUsernameHashResponse(
+          new mod.ChatResponse(404, 'Not Found', null),
+        ),
+        usernameLink404: mod.parseLookUpUsernameLinkResponse(
+          new mod.ChatResponse(404, 'Not Found', null),
+          new Uint8Array(32),
+        ),
+      };
+    });
+
+    expect(result.getPreKeysStatus).toContain('getPreKeys response status was 500');
+    expect(result.getUploadMissingBody).toContain('getUploadForm response body is missing');
+    expect(result.registerMalformedJson).toBeTruthy();
+    expect(result.usernameHashInvalidUuid).toBeTruthy();
+    expect(result.usernameLinkBadEntropy).toContain(
+      'username link entropy must be 32 bytes',
+    );
+    expect(result.accountExistsStatus).toContain('accountExists response status was 503');
+    expect(result.uploadFormBadBase64).toBeTruthy();
+    expect(result.usernameHash404).toBeNull();
+    expect(result.usernameLink404).toBeNull();
+  });
+});
+
+test.describe('Store snapshot parity', () => {
+  test('restores sessions, sender keys, pre-keys, and identity state after exportSnapshot', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+
+      const aliceIdentity = mod.PrivateKey.generate();
+      const bobIdentity = mod.PrivateKey.generate();
+      const aliceStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(aliceIdentity),
+        5,
+      );
+      const bobStore = new mod.SignalProtocolStore(identityPairFromPrivate(bobIdentity), 5);
+      const aliceAddress = mod.ProtocolAddress.new('+14151111111', 1);
+      const bobAddress = mod.ProtocolAddress.new('+19192222222', 1);
+
+      const preKeyId = 31337;
+      const preKey = mod.PrivateKey.generate();
+      const signedPreKeyId = 22;
+      const signedPreKey = mod.PrivateKey.generate();
+      const signedPreKeySignature = bobIdentity.sign(
+        signedPreKey.getPublicKey().serialize(),
+      );
+      const kyberPreKeyId = 777;
+      const kyberKeyPair = mod.KEMKeyPair.generate();
+      const kyberPreKeySignature = bobIdentity.sign(
+        kyberKeyPair.getPublicKey().serialize(),
+      );
+      bobStore.savePreKey(
+        preKeyId,
+        mod.PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
+      );
+      bobStore.saveSignedPreKey(
+        signedPreKeyId,
+        mod.SignedPreKeyRecord.new(
+          signedPreKeyId,
+          42,
+          signedPreKey.getPublicKey(),
+          signedPreKey,
+          signedPreKeySignature,
+        ),
+      );
+      bobStore.saveKyberPreKey(
+        kyberPreKeyId,
+        mod.KyberPreKeyRecord.new(
+          kyberPreKeyId,
+          42,
+          kyberKeyPair,
+          kyberPreKeySignature,
+        ),
+      );
+      const bundle = mod.PreKeyBundle.new(
+        5,
+        1,
+        preKeyId,
+        preKey.getPublicKey(),
+        signedPreKeyId,
+        signedPreKey.getPublicKey(),
+        signedPreKeySignature,
+        bobIdentity.getPublicKey(),
+        kyberPreKeyId,
+        kyberKeyPair.getPublicKey(),
+        kyberPreKeySignature,
+      );
+      mod.processPreKeyBundle(bundle, bobAddress, aliceAddress, aliceStore, 42);
+      const firstCiphertext = mod.signalEncrypt(
+        encoder.encode('before snapshot'),
+        bobAddress,
+        aliceAddress,
+        aliceStore,
+        43,
+      );
+      mod.signalDecrypt(firstCiphertext, aliceAddress, bobAddress, bobStore);
+
+      const distributionId = 'd1d1d1d1-7000-11eb-b32a-33b8a8a487a6';
+      const distribution = mod.SenderKeyDistributionMessage.create(
+        aliceAddress,
+        distributionId,
+        aliceStore,
+      );
+      mod.processSenderKeyDistributionMessage(aliceAddress, distribution, bobStore);
+
+      const restoredAliceStore = mod.SignalProtocolStore.fromSnapshot(
+        aliceStore.exportSnapshot(),
+      );
+      const restoredBobStore = mod.SignalProtocolStore.fromSnapshot(
+        bobStore.exportSnapshot(),
+      );
+      const restoredAliceSession = restoredAliceStore.loadSession(bobAddress);
+      const restoredBobSession = restoredBobStore.loadSession(aliceAddress);
+      const restoredBobSenderKey = restoredBobStore.getSenderKey(
+        aliceAddress,
+        distributionId,
+      );
+
+      const aliceToBob = mod.signalEncrypt(
+        encoder.encode('after snapshot from alice'),
+        bobAddress,
+        aliceAddress,
+        restoredAliceStore,
+        44,
+      );
+      const bobPlaintext = mod.signalDecrypt(
+        aliceToBob,
+        aliceAddress,
+        bobAddress,
+        restoredBobStore,
+      );
+      const bobToAlice = mod.signalEncrypt(
+        encoder.encode('after snapshot from bob'),
+        aliceAddress,
+        bobAddress,
+        restoredBobStore,
+        45,
+      );
+      const alicePlaintext = mod.signalDecrypt(
+        bobToAlice,
+        bobAddress,
+        aliceAddress,
+        restoredAliceStore,
+      );
+      const groupCiphertext = mod.groupEncrypt(
+        aliceAddress,
+        distributionId,
+        restoredAliceStore,
+        encoder.encode('group after snapshot'),
+      );
+      const groupPlaintext = mod.groupDecrypt(
+        aliceAddress,
+        restoredBobStore,
+        groupCiphertext.serialize(),
+      );
+
+      return {
+        aliceSessionRemoteRegistrationId: restoredAliceSession.remoteRegistrationId(),
+        bobSessionRemoteRegistrationId: restoredBobSession.remoteRegistrationId(),
+        senderKeyRestored: restoredBobSenderKey !== undefined && restoredBobSenderKey !== null,
+        bobPlaintext: decoder.decode(bobPlaintext),
+        alicePlaintext: decoder.decode(alicePlaintext),
+        groupPlaintext: decoder.decode(groupPlaintext),
+        aliceSnapshotLength: restoredAliceStore.exportSnapshot().length,
+        bobSnapshotLength: restoredBobStore.exportSnapshot().length,
+      };
+    });
+
+    expect(result).toEqual({
+      aliceSessionRemoteRegistrationId: 5,
+      bobSessionRemoteRegistrationId: 5,
+      senderKeyRestored: true,
+      bobPlaintext: 'after snapshot from alice',
+      alicePlaintext: 'after snapshot from bob',
+      groupPlaintext: 'group after snapshot',
+      aliceSnapshotLength: expect.any(Number),
+      bobSnapshotLength: expect.any(Number),
+    });
+    expect(result.aliceSnapshotLength).toBeGreaterThan(0);
+    expect(result.bobSnapshotLength).toBeGreaterThan(0);
+  });
+
+  test('covers missing state, corrupt data, and manual store round-trips', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const captureError = (callback) => {
+        try {
+          callback();
+          return null;
+        } catch (error) {
+          return error.message;
+        }
+      };
+      const identityPairFromPrivate = (privateKey) => {
+        const privateKeyBytes = privateKey.serialize();
+        const privateClone = mod.PrivateKey.deserialize(privateKeyBytes);
+        const publicClone = mod.PrivateKey.deserialize(privateKeyBytes).getPublicKey();
+        return new mod.IdentityKeyPair(publicClone, privateClone);
+      };
+      const address = mod.ProtocolAddress.new('+14151111111', 1);
+      const otherAddress = mod.ProtocolAddress.new('+19192222222', 1);
+      const store = new mod.SignalProtocolStore(
+        identityPairFromPrivate(mod.PrivateKey.generate()),
+        5,
+      );
+
+      const freshSession = mod.SessionRecord.newFresh();
+      const freshSessionBytes = freshSession.serialize();
+      store.storeSession(address, freshSession);
+      const loadedSession = store.loadSession(address);
+
+      const distributionId = 'd1d1d1d1-7000-11eb-b32a-33b8a8a487a6';
+      const distribution = mod.SenderKeyDistributionMessage.create(
+        address,
+        distributionId,
+        store,
+      );
+      const senderKeyRecord = store.getSenderKey(address, distributionId);
+      const clonedSenderKeyRecord = mod.SenderKeyRecord.deserialize(
+        senderKeyRecord.serialize(),
+      );
+      const secondStore = new mod.SignalProtocolStore(
+        identityPairFromPrivate(mod.PrivateKey.generate()),
+        5,
+      );
+      secondStore.saveSenderKey(address, distributionId, clonedSenderKeyRecord);
+      const secondStoreSenderKey = secondStore.getSenderKey(address, distributionId);
+
+      return {
+        missingSession: store.loadSession(otherAddress) ?? null,
+        missingSenderKey: store.getSenderKey(otherAddress, distributionId) ?? null,
+        loadedSessionSerializedLength: loadedSession.serialize().length,
+        freshSessionSerializedLength: freshSessionBytes.length,
+        senderKeySerializedLength: senderKeyRecord.serialize().length,
+        savedSenderKeySerializedLength: secondStoreSenderKey.serialize().length,
+        distributionIteration: distribution.iteration(),
+        corruptSnapshot: captureError(() =>
+          mod.SignalProtocolStore.fromSnapshot(Uint8Array.of(255, 0, 1)),
+        ),
+        corruptSession: captureError(() =>
+          mod.SessionRecord.deserialize(Uint8Array.of(1, 2, 3)),
+        ),
+        corruptSenderKey: captureError(() =>
+          mod.SenderKeyRecord.deserialize(Uint8Array.of(1, 2, 3)),
+        ),
+      };
+    });
+
+    expect(result.missingSession).toBeNull();
+    expect(result.missingSenderKey).toBeNull();
+    expect(result.loadedSessionSerializedLength).toBe(result.freshSessionSerializedLength);
+    expect(result.senderKeySerializedLength).toBeGreaterThan(0);
+    expect(result.savedSenderKeySerializedLength).toBe(result.senderKeySerializedLength);
+    expect(result.distributionIteration).toBe(0);
+    expect(result.corruptSnapshot).toBeTruthy();
+    expect(result.corruptSession).toBeTruthy();
+    expect(result.corruptSenderKey).toBeTruthy();
+  });
+});
+
+test.describe('Media sanitizer parity', () => {
+  test('matches upstream MP4 and WebP sanitizer fixtures in Chromium', async ({ page }) => {
+    const result = await runWasm(page, (mod) => {
+      const fourcc = (value) => [
+        value.charCodeAt(0),
+        value.charCodeAt(1),
+        value.charCodeAt(2),
+        value.charCodeAt(3),
+      ];
+      const ftyp = () => [
+        0, 0, 0, 20,
+        ...fourcc('ftyp'),
+        ...fourcc('isom'),
+        0, 0, 0, 0,
+        ...fourcc('isom'),
+      ];
+      const moov = () => [
+        0, 0, 0, 56,
+        ...fourcc('moov'),
+        0, 0, 0, 48,
+        ...fourcc('trak'),
+        0, 0, 0, 40,
+        ...fourcc('mdia'),
+        0, 0, 0, 32,
+        ...fourcc('minf'),
+        0, 0, 0, 24,
+        ...fourcc('stbl'),
+        0, 0, 0, 16,
+        ...fourcc('stco'),
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+      ];
+      const mdat = () => [
+        0, 0, 0, 8,
+        ...fourcc('mdat'),
+      ];
+      const webp = () => [
+        ...fourcc('RIFF'),
+        20, 0, 0, 0,
+        ...fourcc('WEBP'),
+        ...fourcc('VP8L'),
+        8, 0, 0, 0,
+        0x2f, 0, 0, 0, 0, 0x88, 0x88, 8,
+      ];
+      const captureError = (callback) => {
+        try {
+          callback();
+          return null;
+        } catch (error) {
+          return error.message;
+        }
+      };
+      const metadataResult = (sanitized) => {
+        const metadata = sanitized.getMetadata();
+        return {
+          metadata: metadata === null ? null : [...metadata],
+          dataOffset: sanitized.getDataOffset().toString(),
+          dataLen: sanitized.getDataLen().toString(),
+        };
+      };
+
+      mod.signalMediaCheckAvailable();
+      const metadata = [...ftyp(), ...moov()];
+      const noRewriteInput = new Uint8Array([...metadata, ...mdat()]);
+      const rewriteInput = new Uint8Array([...ftyp(), ...mdat(), ...moov()]);
+      mod.webpSanitizerSanitize(new Uint8Array(webp()));
+
+      return {
+        noRewrite: metadataResult(mod.mp4SanitizerSanitize(noRewriteInput)),
+        rewrite: metadataResult(mod.mp4SanitizerSanitize(rewriteInput)),
+        mp4EmptyError: captureError(() =>
+          mod.mp4SanitizerSanitize(new Uint8Array()),
+        ),
+        mp4TruncatedError: captureError(() =>
+          mod.mp4SanitizerSanitize(Uint8Array.of(0, 0, 0, 0)),
+        ),
+        webpEmptyError: captureError(() =>
+          mod.webpSanitizerSanitize(new Uint8Array()),
+        ),
+        webpTruncatedError: captureError(() =>
+          mod.webpSanitizerSanitize(Uint8Array.of(0, 0, 0, 0)),
+        ),
+      };
+    });
+
+    const metadata = [
+      0, 0, 0, 20, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0, 105,
+      115, 111, 109, 0, 0, 0, 56, 109, 111, 111, 118, 0, 0, 0, 48, 116, 114,
+      97, 107, 0, 0, 0, 40, 109, 100, 105, 97, 0, 0, 0, 32, 109, 105, 110,
+      102, 0, 0, 0, 24, 115, 116, 98, 108, 0, 0, 0, 16, 115, 116, 99, 111,
+      0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    expect(result.noRewrite).toEqual({
+      metadata: null,
+      dataOffset: '76',
+      dataLen: '8',
+    });
+    expect(result.rewrite).toEqual({
+      metadata,
+      dataOffset: '20',
+      dataLen: '8',
+    });
+    expect(result.mp4EmptyError).toBeTruthy();
+    expect(result.mp4TruncatedError).toBeTruthy();
+    expect(result.webpEmptyError).toBeTruthy();
+    expect(result.webpTruncatedError).toBeTruthy();
+  });
+});
