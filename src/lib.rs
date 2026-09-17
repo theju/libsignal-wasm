@@ -36,7 +36,6 @@ use libsignal_protocol::{
     message_decrypt, message_encrypt, process_prekey_bundle,
     process_sender_key_distribution_message, sealed_sender_decrypt, sealed_sender_decrypt_to_usmc,
     sealed_sender_encrypt, sealed_sender_encrypt_from_usmc, sealed_sender_multi_recipient_encrypt,
-    should_use_nonpq_session,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -74,6 +73,7 @@ use zkgroup::call_links::{
 use zkgroup::generic_server_params::{
     GenericServerPublicParams as ZkGenericServerPublicParams,
     GenericServerSecretParams as ZkGenericServerSecretParams,
+    GenericServerSecretParamsLegacy as ZkGenericServerSecretParamsLegacy,
 };
 use zkgroup::groups::{
     GroupMasterKey as ZkGroupMasterKey, GroupPublicParams as ZkGroupPublicParams,
@@ -1423,7 +1423,7 @@ impl KyberPreKeyStore for BrowserKyberPreKeyStore {
         if seen.contains(base_key) {
             return Err(SignalProtocolError::InvalidMessage(
                 libsignal_protocol::CiphertextMessageType::PreKey,
-                "reused base key",
+                "reused base key".to_owned(),
             ));
         }
         seen.push(*base_key);
@@ -3293,24 +3293,26 @@ impl GenericServerSecretParams {
         let mut randomness = [0; RANDOMNESS_LEN];
         getrandom::fill(&mut randomness).map_err(js_error)?;
         Ok(Self {
-            inner: ZkGenericServerSecretParams::generate(randomness),
+            inner: ZkGenericServerSecretParamsLegacy::generate(randomness).into(),
         })
     }
 
     #[wasm_bindgen(js_name = generateWithRandom)]
     pub fn generate_with_random(randomness: &[u8]) -> Result<GenericServerSecretParams, JsError> {
         Ok(Self {
-            inner: ZkGenericServerSecretParams::generate(fixed_array(
+            inner: ZkGenericServerSecretParamsLegacy::generate(fixed_array(
                 randomness,
                 "zkgroup randomness",
-            )?),
+            )?)
+            .into(),
         })
     }
 
     #[wasm_bindgen(constructor)]
     pub fn new(contents: &[u8]) -> Result<GenericServerSecretParams, JsError> {
         Ok(Self {
-            inner: zkgroup_deserialize(contents, "generic server secret params")?,
+            inner: ZkGenericServerSecretParams::try_from(contents)
+                .map_err(|_| JsError::new("invalid generic server secret params"))?,
         })
     }
 
@@ -5209,7 +5211,8 @@ impl GenericServerPublicParams {
     #[wasm_bindgen(constructor)]
     pub fn new(contents: &[u8]) -> Result<GenericServerPublicParams, JsError> {
         Ok(Self {
-            inner: zkgroup_deserialize(contents, "generic server public params")?,
+            inner: ZkGenericServerPublicParams::try_from(contents)
+                .map_err(|_| JsError::new("invalid generic server public params"))?,
         })
     }
 
@@ -7865,34 +7868,16 @@ impl SessionRecord {
     }
 
     #[wasm_bindgen(js_name = hasCurrentState)]
-    pub fn has_current_state(&self, require_pq_ratio: f64, now: f64) -> Result<bool, JsError> {
+    pub fn has_current_state(&self, now: f64) -> Result<bool, JsError> {
         let now = timestamp_from_js_millis(now)?;
-        let has_chain = self
-            .inner
-            .has_usable_sender_chain(now.into(), SessionUsabilityRequirements::NotStale)
-            .map_err(js_error)?;
-        if !has_chain {
-            return Ok(false);
-        }
-
-        let has_pq_chain = self
-            .inner
+        self.inner
             .has_usable_sender_chain(
                 now.into(),
                 SessionUsabilityRequirements::NotStale
                     | SessionUsabilityRequirements::EstablishedWithPqxdh
                     | SessionUsabilityRequirements::Spqr,
             )
-            .map_err(js_error)?;
-        if has_pq_chain || require_pq_ratio == 0.0 {
-            return Ok(true);
-        }
-
-        let require_pq_ratio = require_pq_ratio.clamp(0.0, 1.0);
-        Ok(should_use_nonpq_session(
-            require_pq_ratio,
-            self.inner.alice_base_key().map_err(js_error)?,
-        ))
+            .map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = currentRatchetKeyMatches)]

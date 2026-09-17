@@ -2,7 +2,7 @@
 
 This document explains how Signal Protocol concepts map to the upstream `libsignal` Rust crates
 vendored in this repository, and how this browser/WASM wrapper exposes the browser-compatible
-parts. The project is generated against `libsignal` v0.94.0.
+parts. The project is generated against `libsignal` v0.102.3.
 
 ## Big Picture
 

@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 aes-gcm-siv = "0.11"
 async-trait = "0.1"
 futures = "0.3"
@@ -37,6 +38,3 @@ mediasan-common = "0.5.3"
 codegen-units = 1
 lto = true
 opt-level = "z"
-
-[patch.crates-io]
-curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

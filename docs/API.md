@@ -304,13 +304,13 @@ Methods:
 | `SessionRecord.deserialize(buffer)` | Parses serialized session record bytes |
 | `serialize()` | Returns libsignal session-record protobuf bytes |
 | `archiveCurrentState()` | Archives the current state if present |
-| `hasCurrentState(requirePqRatio, now)` | Checks whether the current session can send |
+| `hasCurrentState(now)` | Checks whether the current session has a non-stale PQXDH/SPQR sender chain |
 | `currentRatchetKeyMatches(key)` | Checks current ratchet key match |
 | `localRegistrationId()` | Returns local registration ID; throws for fresh records |
 | `remoteRegistrationId()` | Returns remote registration ID; throws for fresh records |
 
-Unlike Node, `hasCurrentState` currently requires a numeric `now` timestamp argument. Node accepts
-an optional `Date` and defaults it to the current time.
+Unlike Node, `hasCurrentState` requires a numeric `now` timestamp in milliseconds. Node accepts an
+optional `Date` and defaults it to the current time.
 
 ## KEM And Bundle API
 

@@ -4,7 +4,7 @@ Browser-oriented WASM wrapper for Signal's Rust `libsignal` implementation.
 
 This repository vendors `signalapp/libsignal` under `vendor/libsignal` and builds a small
 `wasm-bindgen` adapter crate at the repo root. This code has been generated against
-`libsignal` v0.94.0. The current exported surface covers the first browser-compatible slice of
+`libsignal` v0.102.3. The current exported surface covers the first browser-compatible slice of
 the Node API:
 
 - `PublicKey`, `PrivateKey`, and `IdentityKeyPair`
